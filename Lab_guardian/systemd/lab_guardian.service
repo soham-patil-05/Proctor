@@ -1,0 +1,26 @@
+[Unit]
+Description=Lab Guardian Student Agent
+After=network-online.target auditd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lab_guardian join --roll-no ${ROLL_NO} --session-id ${SESSION_ID}
+EnvironmentFile=-/etc/lab_guardian/env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lab_guardian
+
+# Sandboxing
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Allow reading audit log for Layer 2 network monitoring
+ReadOnlyPaths=/var/log/audit
+
+[Install]
+WantedBy=multi-user.target

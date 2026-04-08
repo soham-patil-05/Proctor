@@ -1,0 +1,11 @@
+Package: lab-guardian
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.9), python3-pip, python3-psutil, python3-requests
+Maintainer: Lab Insight Team <labinsight@example.com>
+Description: Lab Guardian — Student monitoring agent
+ Lightweight Python agent that reports running processes,
+ connected devices and network information to the Lab Insight
+ backend via WebSocket.

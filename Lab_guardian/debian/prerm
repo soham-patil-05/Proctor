@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+
+# Stop service on removal
+if [ -d /run/systemd/system ]; then
+    systemctl stop lab_guardian.service 2>/dev/null || true
+    systemctl disable lab_guardian.service 2>/dev/null || true
+    rm -f /etc/systemd/system/lab_guardian.service
+    systemctl daemon-reload
+fi
+
+pip3 uninstall -y lab_guardian 2>/dev/null || true

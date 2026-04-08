@@ -1,0 +1,16 @@
+#!/bin/bash
+set -e
+
+# Install Python package and its dependencies
+pip3 install /opt/lab_guardian
+
+# Create config directory
+mkdir -p /etc/lab_guardian
+
+# Install systemd service
+if [ -d /run/systemd/system ]; then
+    cp /opt/lab_guardian/systemd/lab_guardian.service /etc/systemd/system/
+    systemctl daemon-reload
+    echo "lab_guardian.service installed. Configure /etc/lab_guardian/env then run:"
+    echo "  systemctl enable --now lab_guardian"
+fi

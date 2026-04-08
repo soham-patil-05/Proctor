@@ -1,0 +1,35 @@
+{
+  "name": "lab-monitor-backend",
+  "version": "1.0.0",
+  "description": "Teacher Lab Monitoring backend — Postgres + Redis + Express + WebSocket",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "ws": "node src/ws-server.js",
+    "dev": "node --watch src/server.js",
+    "dev:ws": "node --watch src/ws-server.js",
+    "migrate": "node src/scripts/migrate.js",
+    "cleanup": "node src/scripts/cleanup.js",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --forceExit",
+    "test:e2e": "node tests/e2e/flow.test.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.0",
+    "redis": "^4.7.0",
+    "uuid": "^10.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@jest/globals": "^29.7.0",
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0"
+  },
+  "jest": {
+    "transform": {}
+  }
+}

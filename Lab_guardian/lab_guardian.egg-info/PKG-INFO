@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: lab_guardian
+Version: 1.0.0
+Summary: Lab Guardian — student agent for Lab Insight monitoring
+Author: Lab Insight Team
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: POSIX :: Linux
+Requires-Python: >=3.9
+Requires-Dist: psutil>=5.9.0
+Requires-Dist: websockets>=12.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: netifaces>=0.11.0
+Requires-Dist: pyudev>=0.24.0
+Dynamic: author
+Dynamic: classifier
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
