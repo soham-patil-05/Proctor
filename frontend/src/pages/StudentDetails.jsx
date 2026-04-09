@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import { ArrowLeft, AlertCircle, Wifi, WifiOff, Shield, ShieldAlert, ShieldCheck, Globe, Usb, Monitor, Terminal, Activity, Code } from 'lucide-react';
+import { ArrowLeft, AlertCircle, Wifi, WifiOff, Shield, ShieldAlert, ShieldCheck, Globe, Usb, Monitor, Terminal, Activity, Code, History } from 'lucide-react';
 import { api } from '../services/api';
 import WebSocketService from '../services/socket';
 import Button from '../components/ui/Button';
@@ -108,6 +108,7 @@ export default function StudentDetails() {
   const [network, setNetwork] = useState(null);
   const [processes, setProcesses] = useState([]);
   const [domainActivity, setDomainActivity] = useState([]);
+  const [browserHistory, setBrowserHistory] = useState([]);
   const [terminalEvents, setTerminalEvents] = useState([]);
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
@@ -252,6 +253,37 @@ export default function StudentDetails() {
           }
           return Array.from(merged.values()).sort(
             (a, b) => (b.request_count || 0) - (a.request_count || 0)
+          );
+        });
+      }
+    });
+
+    /* ── Browser history events ─────────────────────────────── */
+
+    ws.on('browser_history', (data) => {
+      if (Array.isArray(data)) {
+        setBrowserHistory((prev) => {
+          const merged = new Map(prev.map((h) => [h.url, h]));
+          for (const entry of data) {
+            const existing = merged.get(entry.url);
+            if (existing) {
+              merged.set(entry.url, {
+                ...existing,
+                visit_count: Math.max(existing.visit_count || 0, entry.visit_count || 0),
+                last_visited: Math.max(existing.last_visited || 0, entry.last_visited || 0),
+              });
+            } else {
+              merged.set(entry.url, {
+                url: entry.url,
+                title: entry.title || '',
+                visit_count: entry.visit_count || 1,
+                last_visited: entry.last_visited || Date.now() / 1000,
+                browser: entry.browser || 'Unknown',
+              });
+            }
+          }
+          return Array.from(merged.values()).sort(
+            (a, b) => (b.last_visited || 0) - (a.last_visited || 0)
           );
         });
       }
@@ -422,73 +454,167 @@ export default function StudentDetails() {
       (a, b) => (b.request_count || 0) - (a.request_count || 0)
     );
 
+    const formatUrl = (url) => {
+      try {
+        const urlObj = new URL(url);
+        return urlObj.hostname + urlObj.pathname;
+      } catch {
+        return url;
+      }
+    };
+
+    const formatTime = (timestamp) => {
+      if (!timestamp) return 'Unknown';
+      const date = new Date(timestamp * 1000);
+      return date.toLocaleTimeString();
+    };
+
     return (
-      <div className="space-y-4">
-        <SectionHeader icon={Globe} title="Top Websites Accessed" count={sortedDomains.length} />
-        {sortedDomains.length === 0 ? (
-          <div className="text-center py-10">
-            <Globe className="h-10 w-10 mx-auto text-[var(--color-gray-300)] mb-3" />
-            <p className="text-sm text-[var(--color-gray-500)]">No domain activity recorded</p>
-          </div>
-        ) : (
-          <div className="space-y-2">
-            {sortedDomains.map((entry) => {
-              const risk = entry.risk_level || classifyDomain(entry.domain);
-              return (
+      <div className="space-y-6">
+        {/* Browser History - Full URLs */}
+        <div className="space-y-3">
+          <SectionHeader icon={History} title="Browser History" count={browserHistory.length} />
+          {browserHistory.length === 0 ? (
+            <div className="text-center py-8 bg-[var(--color-gray-50)] rounded-lg">
+              <History className="h-8 w-8 mx-auto text-[var(--color-gray-300)] mb-2" />
+              <p className="text-sm text-[var(--color-gray-500)]">No browser history available</p>
+              <p className="text-xs text-[var(--color-gray-400)] mt-1">Supports Chrome, Firefox, Edge, Brave</p>
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-96 overflow-y-auto">
+              {browserHistory.slice(0, 50).map((entry, index) => (
                 <div
-                  key={entry.domain}
-                  className={`flex items-center justify-between p-3 rounded-lg transition-all duration-200 ${
-                    risk === 'high'
-                      ? 'bg-red-50 border border-[var(--color-error)] border-opacity-30'
-                      : 'bg-[var(--color-gray-50)] hover:bg-[var(--color-gray-100)]'
-                  }`}
+                  key={entry.url || index}
+                  className="flex items-start justify-between p-3 rounded-lg bg-[var(--color-gray-50)] hover:bg-[var(--color-gray-100)] transition-all duration-200"
                 >
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-[var(--color-gray-900)] truncate">
-                      {entry.domain}
+                      {entry.title || formatUrl(entry.url)}
                     </p>
-                  </div>
-                  <div className="flex items-center gap-3 ml-4 shrink-0">
-                    <span className="text-xs text-[var(--color-gray-500)]">
-                      {entry.request_count} request{entry.request_count !== 1 ? 's' : ''}
-                    </span>
-                    <RiskBadge level={risk} />
+                    <p className="text-xs text-[var(--color-blue-600)] mt-0.5 truncate">
+                      {entry.url}
+                    </p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-xs text-[var(--color-gray-500)]">
+                        {entry.browser}
+                      </span>
+                      <span className="text-xs text-[var(--color-gray-400)]">•</span>
+                      <span className="text-xs text-[var(--color-gray-500)]">
+                        Visited: {formatTime(entry.last_visited)}
+                      </span>
+                      {entry.visit_count > 1 && (
+                        <>
+                          <span className="text-xs text-[var(--color-gray-400)]">•</span>
+                          <span className="text-xs text-[var(--color-gray-500)]">
+                            {entry.visit_count} visits
+                          </span>
+                        </>
+                      )}
+                    </div>
                   </div>
                 </div>
-              );
-            })}
-          </div>
-        )}
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Domain Activity - Summary */}
+        <div className="space-y-3">
+          <SectionHeader icon={Globe} title="Top Domains Accessed" count={sortedDomains.length} />
+          {sortedDomains.length === 0 ? (
+            <div className="text-center py-8">
+              <Globe className="h-8 w-8 mx-auto text-[var(--color-gray-300)] mb-2" />
+              <p className="text-sm text-[var(--color-gray-500)]">No domain activity recorded</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {sortedDomains.slice(0, 20).map((entry) => {
+                const risk = entry.risk_level || classifyDomain(entry.domain);
+                return (
+                  <div
+                    key={entry.domain}
+                    className={`flex items-center justify-between p-3 rounded-lg transition-all duration-200 ${
+                      risk === 'high'
+                        ? 'bg-red-50 border border-[var(--color-error)] border-opacity-30'
+                        : 'bg-[var(--color-gray-50)] hover:bg-[var(--color-gray-100)]'
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-[var(--color-gray-900)] truncate">
+                        {entry.domain}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3 ml-4 shrink-0">
+                      <span className="text-xs text-[var(--color-gray-500)]">
+                        {entry.request_count} request{entry.request_count !== 1 ? 's' : ''}
+                      </span>
+                      <RiskBadge level={risk} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
     );
   };
 
   /* ── Section: Processes ───────────────────────────────────── */
 
-  const renderProcessList = (procs, riskLevel, colorClasses) => (
-    <div className="space-y-2">
-      {procs.map((proc) => (
-        <div
-          key={proc.pid}
-          className={`flex items-center justify-between p-3 rounded-lg transition-all duration-300 ${
-            highlightedPids.has(proc.pid)
-              ? `${colorClasses.highlightBg}`
-              : `${colorClasses.hoverBg}`
-          }`}
-        >
-          <div className="flex-1 min-w-0">
-            <p className="font-semibold text-sm text-[var(--color-gray-900)]">
-              {proc.label || proc.name}
-            </p>
-            <p className="text-xs text-[var(--color-gray-500)] mt-0.5">
-              PID: {proc.pid} · CPU: {Number(proc.cpu)?.toFixed(1)}% · Mem: {Number(proc.memory)?.toFixed(1)} MB
-            </p>
+  const renderProcessList = (procs, riskLevel, colorClasses) => {
+    // Group processes by name
+    const grouped = procs.reduce((acc, proc) => {
+      const name = proc.label || proc.name;
+      if (!acc[name]) {
+        acc[name] = {
+          name,
+          pids: [],
+          totalCpu: 0,
+          totalMemory: 0,
+          count: 0,
+          riskLevel: proc.risk_level || riskLevel,
+        };
+      }
+      acc[name].pids.push(proc.pid);
+      acc[name].totalCpu += Number(proc.cpu) || 0;
+      acc[name].totalMemory += Number(proc.memory) || 0;
+      acc[name].count += 1;
+      return acc;
+    }, {});
+
+    const groupedArray = Object.values(grouped);
+
+    return (
+      <div className="space-y-2">
+        {groupedArray.map((group) => (
+          <div
+            key={group.name}
+            className={`flex items-center justify-between p-3 rounded-lg transition-all duration-300 ${
+              highlightedPids.has(group.pids[0])
+                ? `${colorClasses.highlightBg}`
+                : `${colorClasses.hoverBg}`
+            }`}
+          >
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold text-sm text-[var(--color-gray-900)]">
+                {group.name}
+                {group.count > 1 && (
+                  <span className="ml-2 text-xs text-[var(--color-gray-500)]">
+                    ({group.count} instances)
+                  </span>
+                )}
+              </p>
+              <p className="text-xs text-[var(--color-gray-500)] mt-0.5">
+                PIDs: {group.pids.join(', ')} · CPU: {group.totalCpu.toFixed(1)}% · Mem: {group.totalMemory.toFixed(1)} MB
+              </p>
+            </div>
+            <RiskBadge level={group.riskLevel} />
           </div>
-          <RiskBadge level={riskLevel} />
-        </div>
-      ))}
-    </div>
-  );
+        ))}
+      </div>
+    );
+  };
 
   const renderProcessesSection = () => {
     const noProcesses = highRiskProcesses.length === 0 && suspiciousProcesses.length === 0;

@@ -1,0 +1,238 @@
+"""browser_history.py — Scan browser history databases for visited URLs.
+
+Supports:
+  - Google Chrome / Chromium
+  - Mozilla Firefox
+  - Microsoft Edge
+  - Brave
+
+Extracts full URLs with visit timestamps and visit counts.
+"""
+
+import logging
+import os
+import sqlite3
+import time
+from pathlib import Path
+from typing import List, Dict
+
+log = logging.getLogger("lab_guardian.monitor.browser_history")
+
+# Browser history database locations
+BROWSER_PATHS = {
+    'chrome': {
+        'linux': '~/.config/google-chrome/Default/History',
+        'name': 'Google Chrome'
+    },
+    'chromium': {
+        'linux': '~/.config/chromium/Default/History',
+        'name': 'Chromium'
+    },
+    'brave': {
+        'linux': '~/.config/BraveSoftware/Brave-Browser/Default/History',
+        'name': 'Brave'
+    },
+    'edge': {
+        'linux': '~/.config/microsoft-edge/Default/History',
+        'name': 'Microsoft Edge'
+    },
+    'firefox': {
+        'linux': '~/.mozilla/firefox/*/places.sqlite',
+        'name': 'Mozilla Firefox'
+    }
+}
+
+
+def _get_browser_db_path(browser_key: str) -> List[str]:
+    """Get the database path(s) for a browser."""
+    browser_info = BROWSER_PATHS.get(browser_key, {})
+    path_template = browser_info.get('linux', '')
+    
+    if not path_template:
+        return []
+    
+    # Expand home directory
+    path = os.path.expanduser(path_template)
+    
+    # Handle glob patterns (for Firefox with random profile names)
+    if '*' in path:
+        from glob import glob
+        return glob(path)
+    
+    return [path] if os.path.exists(path) else []
+
+
+def _read_chrome_history(db_path: str, since_timestamp: float = None) -> List[Dict]:
+    """Read Chrome/Chromium/Brave/Edge history database.
+    
+    Returns list of dicts with url, title, visit_count, last_visit_time
+    """
+    urls = []
+    try:
+        # Copy DB to avoid locking issues
+        import shutil
+        temp_db = f"/tmp/browser_history_{os.getpid()}.db"
+        shutil.copy2(db_path, temp_db)
+        
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        
+        # Chrome stores time as microseconds since Jan 1, 1601
+        # Convert to Unix timestamp (seconds since Jan 1, 1970)
+        chrome_epoch_offset = 11644473600000000  # microseconds
+        
+        query = """
+            SELECT url, title, visit_count, last_visit_time 
+            FROM urls 
+            ORDER BY last_visit_time DESC
+            LIMIT 100
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        
+        for row in rows:
+            url, title, visit_count, chrome_time = row
+            
+            # Convert Chrome time to Unix timestamp
+            if chrome_time:
+                unix_timestamp = (chrome_time - chrome_epoch_offset) / 1000000
+            else:
+                unix_timestamp = 0
+            
+            # Skip if older than our last check
+            if since_timestamp and unix_timestamp < since_timestamp:
+                continue
+            
+            urls.append({
+                'url': url,
+                'title': title or '',
+                'visit_count': visit_count or 1,
+                'last_visited': unix_timestamp,
+                'browser': 'Chrome'
+            })
+        
+        conn.close()
+        os.remove(temp_db)
+        
+    except Exception as e:
+        log.debug(f"Error reading Chrome history from {db_path}: {e}")
+    
+    return urls
+
+
+def _read_firefox_history(db_path: str, since_timestamp: float = None) -> List[Dict]:
+    """Read Firefox history database (places.sqlite).
+    
+    Returns list of dicts with url, title, visit_count, last_visit_date
+    """
+    urls = []
+    try:
+        import shutil
+        temp_db = f"/tmp/browser_history_{os.getpid()}.db"
+        shutil.copy2(db_path, temp_db)
+        
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        
+        # Firefox stores time in microseconds since Jan 1, 1970
+        query = """
+            SELECT p.url, p.title, p.visit_count, p.last_visit_date
+            FROM moz_places p
+            WHERE p.visit_count > 0
+            ORDER BY p.last_visit_date DESC
+            LIMIT 100
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        
+        for row in rows:
+            url, title, visit_count, moz_time = row
+            
+            # Convert Firefox time (microseconds) to seconds
+            if moz_time:
+                unix_timestamp = moz_time / 1000000
+            else:
+                unix_timestamp = 0
+            
+            # Skip if older than our last check
+            if since_timestamp and unix_timestamp < since_timestamp:
+                continue
+            
+            urls.append({
+                'url': url,
+                'title': title or '',
+                'visit_count': visit_count or 1,
+                'last_visited': unix_timestamp,
+                'browser': 'Firefox'
+            })
+        
+        conn.close()
+        os.remove(temp_db)
+        
+    except Exception as e:
+        log.debug(f"Error reading Firefox history from {db_path}: {e}")
+    
+    return urls
+
+
+def scan_browser_history(since_timestamp: float = None) -> List[Dict]:
+    """Scan all available browser histories.
+    
+    Args:
+        since_timestamp: Only return URLs visited after this Unix timestamp
+        
+    Returns:
+        List of dicts with url, title, visit_count, last_visited, browser
+    """
+    all_urls = []
+    
+    # Chrome-based browsers
+    for browser_key in ['chrome', 'chromium', 'brave', 'edge']:
+        db_paths = _get_browser_db_path(browser_key)
+        for db_path in db_paths:
+            if os.path.exists(db_path):
+                log.info(f"Scanning {BROWSER_PATHS[browser_key]['name']} history")
+                urls = _read_chrome_history(db_path, since_timestamp)
+                all_urls.extend(urls)
+    
+    # Firefox
+    firefox_paths = _get_browser_db_path('firefox')
+    for db_path in firefox_paths:
+        if os.path.exists(db_path):
+            log.info("Scanning Firefox history")
+            urls = _read_firefox_history(db_path, since_timestamp)
+            all_urls.extend(urls)
+    
+    # Sort by last visited time (most recent first)
+    all_urls.sort(key=lambda x: x['last_visited'], reverse=True)
+    
+    log.info(f"Found {len(all_urls)} URLs from browser history")
+    return all_urls
+
+
+# Track last scan time
+_last_scan_time = 0
+_last_urls = []
+
+
+def get_new_history() -> List[Dict]:
+    """Get only newly visited URLs since last scan.
+    
+    Returns:
+        List of new URL entries
+    """
+    global _last_scan_time, _last_urls
+    
+    # Scan for history
+    current_urls = scan_browser_history(since_timestamp=_last_scan_time)
+    
+    # Update scan time
+    _last_scan_time = time.time()
+    
+    # Return only new URLs
+    new_urls = current_urls
+    
+    _last_urls = current_urls
+    return new_urls

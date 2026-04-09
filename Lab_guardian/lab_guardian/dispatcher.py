@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from . import ws_client
-from .monitor import process_monitor, device_monitor, network_monitor, browser_monitor
+from .monitor import process_monitor, device_monitor, network_monitor, browser_history
 
 log = logging.getLogger("lab_guardian.dispatcher")
 
@@ -30,13 +30,40 @@ async def run(session_id: str, student_id: str, token: str):
             evt = await _queue.get()
             await ws_client.send(evt)
 
+    async def browser_history_monitor(send_fn):
+        """Monitor browser history for visited URLs."""
+        import time
+        log.info("Browser history monitor started")
+        last_scan = time.time() - 300  # Start 5 mins ago to get recent history
+        
+        while True:
+            try:
+                new_urls = browser_history.get_new_history()
+                if new_urls:
+                    # Send as browser_history event
+                    await send_fn({
+                        "type": "browser_history",
+                        "data": new_urls,
+                        "ts": time.time(),
+                        "meta": {
+                            "risk_level": "normal",
+                            "category": "browser",
+                            "message": f"{len(new_urls)} URL(s) from browser history",
+                        },
+                    })
+            except Exception as e:
+                log.debug(f"Browser history scan error: {e}")
+            
+            # Scan every 10 seconds
+            await asyncio.sleep(10)
+
     # Launch all concurrently
     tasks = [
         asyncio.create_task(ws_client.start(session_id, student_id, token), name="ws"),
         asyncio.create_task(process_monitor.run(enqueue), name="proc"),
         asyncio.create_task(device_monitor.run(enqueue), name="dev"),
         asyncio.create_task(network_monitor.run(enqueue), name="net"),
-        asyncio.create_task(browser_monitor.run(enqueue), name="browser"),
+        asyncio.create_task(browser_history_monitor(enqueue), name="browser"),
         asyncio.create_task(drain(), name="drain"),
     ]
 

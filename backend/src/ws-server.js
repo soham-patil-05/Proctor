@@ -102,6 +102,7 @@ const VALID_TYPES = new Set([
     'devices_snapshot', 'device_connected', 'device_disconnected',
     'network_snapshot', 'network_update', 'domain_activity',
     'terminal_request', 'terminal_command',
+    'browser_history',
     'heartbeat',
 ]);
 
@@ -380,6 +381,9 @@ wss.on('connection', async (ws, req) => {
                             msg.data.risk_level,
                             msg.data.message
                         );
+                        break;
+                    case 'browser_history':
+                        // Just forward to teachers, no DB storage needed
                         break;
                     case 'heartbeat':
                         break;

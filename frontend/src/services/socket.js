@@ -47,12 +47,19 @@ class WebSocketService {
           reject(error);
         };
 
-        this.ws.onclose = () => {
+        this.ws.onclose = (event) => {
           this.stopHeartbeat();
-          this.emit('disconnected');
+          
+          // Don't emit 'disconnected' if it was a manual close
+          if (!this.isManualClose) {
+            console.log('WebSocket closed unexpectedly, code:', event.code);
+            this.emit('disconnected');
 
-          if (!this.isManualClose && this.reconnectAttempts < this.maxReconnectAttempts) {
-            this.reconnect(sessionId, rollNo, token);
+            if (this.reconnectAttempts < this.maxReconnectAttempts) {
+              this.reconnect(sessionId, rollNo, token);
+            }
+          } else {
+            console.log('WebSocket closed manually');
           }
         };
       } catch (error) {
@@ -81,11 +88,13 @@ class WebSocketService {
     this.heartbeatInterval = setInterval(() => {
       const timeSinceLastHeartbeat = Date.now() - this.lastHeartbeat;
 
-      if (timeSinceLastHeartbeat > 10000) {
+      // Only mark as lost if no heartbeat for 30 seconds (more lenient)
+      if (timeSinceLastHeartbeat > 30000 && this.ws.readyState === WebSocket.OPEN) {
+        console.warn('Connection lost - no heartbeat for 30s');
         this.emit('connectionLost');
         this.stopHeartbeat();
       }
-    }, 5000);
+    }, 10000); // Check every 10 seconds instead of 5
   }
 
   stopHeartbeat() {
