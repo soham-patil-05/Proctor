@@ -135,6 +135,21 @@ _last_connections: Set[tuple] = set()
 _SKIP_PRIVATE: Set[str] = {"127.0.0.1", "0.0.0.0", "::1", "::"}
 _IP_CACHE: dict = {}
 
+# Infrastructure/CDN domains to filter out (not actual websites users visit)
+_INFRASTRUCTURE_DOMAINS: Set[str] = {
+    '1e100.net',  # Google infrastructure
+    'google.com',  # Will be caught by specific Google services
+    'gstatic.com', 'ggpht.com', 'ytimg.com',  # Google static content
+    'akamai.net', 'akamaiedge.net', 'akamaihd.net',
+    'cloudfront.net', 'amazonaws.com', 'awsstatic.com',
+    'azureedge.net', 'azurewebsites.net', 'microsoftonline.com',
+    'facebook.com', 'fbcdn.net',  # Facebook CDN
+    'twitter.com', 'twimg.com',
+    'cdn.jsdelivr.net', 'unpkg.com', 'cdnjs.cloudflare.com',
+    'googleusercontent.com', 'githubusercontent.com',
+    'appspot.com', 'blogspot.com',
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Layer 1 — ss-based terminal tool detection
@@ -516,6 +531,7 @@ def _collect_domains() -> None:
     
     This is the PRIMARY method for tracking visited websites.
     Resolves IP addresses to domain names and counts connections.
+    Filters out infrastructure/CDN domains to show only actual websites.
     """
     global _last_connections
     try:
@@ -533,10 +549,11 @@ def _collect_domains() -> None:
         remote_ip = raddr.ip
         remote_port = raddr.port
         
-        # Skip private/local IPs
+        # Skip private/local IPs (they don't represent external websites)
         if remote_ip.startswith(('127.', '192.168.', '10.', '172.')):
-            # Still track but with lower priority
-            pass
+            conn_key = (remote_ip, remote_port, c.pid)
+            current.add(conn_key)
+            continue
             
         conn_key = (remote_ip, remote_port, c.pid)
         current.add(conn_key)
@@ -546,12 +563,18 @@ def _collect_domains() -> None:
             domain = _resolve_ip(remote_ip)
             if domain:
                 root = _extract_root_domain(domain)
-                # Skip common CDNs and infrastructure
-                if root and not any(skip in root for skip in [
-                    'akamai.net', 'cloudfront.net', 'azureedge.net',
-                    'googleusercontent.com', 'amazonaws.com'
-                ]):
-                    _domain_counter[root] += 1
+                # Filter out infrastructure/CDN domains
+                # We only want actual websites the user visits
+                if root and root not in _INFRASTRUCTURE_DOMAINS:
+                    # Also check if any infrastructure domain is in the full hostname
+                    is_infra = False
+                    for infra in _INFRASTRUCTURE_DOMAINS:
+                        if domain.endswith('.' + infra) or infra in domain:
+                            is_infra = True
+                            break
+                    
+                    if not is_infra:
+                        _domain_counter[root] += 1
 
     _last_connections = current
 
@@ -583,20 +606,32 @@ def _classify_domain(domain: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _build_ss_event(conn: SSConnection) -> dict:
-    """Build event envelope for a terminal request detected via ss."""
+    """Build event envelope for a terminal request detected via ss.
+    
+    Only includes actual terminal tools (curl, wget, git, etc.)
+    Filters out browser-related connections.
+    """
+    # Skip if this is a browser process (not a terminal tool)
+    browser_processes = {
+        'chrome', 'chromium', 'firefox', 'msedge', 'brave', 
+        'opera', 'vivaldi', 'safari', 'epiphany'
+    }
+    if conn.tool_name.lower() in browser_processes:
+        return None  # Don't create event for browser activity
+    
     host_display = conn.remote_host or conn.remote_ip
     if conn.remote_host:
         root = _extract_root_domain(conn.remote_host)
         host_display = root
 
     message = (
-        f"\u26a0\ufe0f TERMINAL REQUEST DETECTED  |  "
-        f"{conn.tool_name} \u2192 {conn.remote_ip} ({host_display}):{conn.remote_port}"
+        f"⚠️ TERMINAL REQUEST DETECTED  |  "
+        f"{conn.tool_name} → {conn.remote_ip} ({host_display}):{conn.remote_port}"
     )
     if conn.risk_level != "high":
         message = (
             f"Terminal Connection  |  "
-            f"{conn.tool_name} \u2192 {conn.remote_ip} ({host_display}):{conn.remote_port}"
+            f"{conn.tool_name} → {conn.remote_ip} ({host_display}):{conn.remote_port}"
         )
 
     return {
@@ -690,7 +725,8 @@ async def run(send_fn):
                 new_conns = await loop.run_in_executor(None, _poll_ss)
                 for conn in new_conns:
                     event = _build_ss_event(conn)
-                    await send_fn(event)
+                    if event:  # Only send if not filtered out
+                        await send_fn(event)
             except Exception as e:
                 log.debug("ss polling error: %s", e)
             last_ss_ts = now

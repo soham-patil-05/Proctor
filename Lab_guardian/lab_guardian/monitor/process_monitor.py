@@ -43,19 +43,22 @@ SAFE_PROCESSES = {
     "wininit", "taskhost", "taskhostw", "spoolsv", "searchindexer", 
     "searchprotocolhost", "searchfilterhost", "runtimebroker", 
     "shellexperiencehost", "sihost", "ctfmon", "fontdrvhost", "dllhost",
-    "lsaiso", "wmiprvse", "conhost", "compattelrunner", "moone", 
+    "lsaiso", "wmiprvse", "conhost", "compattelrunner", "moone",
     
-    # Common safe processes
-    "chrome", "firefox", "msedge", "brave", "opera", "vivaldi",  # Browsers
-    "code", "code-helper", "code-insiders",  # VS Code
-    "explorer", "nautilus", "dolphin", "thunar", "xfce4-panel", "gnome-shell",  # File managers/DE
-    
-    # IDE and dev tools (usually safe)
-    "node", "npm", "python", "python3", "java", "javac", "gcc", "g++",
-    "clang", "clangd", "cmake", "make", "git", "docker", "containerd",
+    # File managers/DE (safe but we want to track browsers separately)
+    "explorer", "nautilus", "dolphin", "thunar", "xfce4-panel", "gnome-shell",
 }
 
 SUSPICIOUS_PROCESSES = {
+    # Web Browsers (important to track)
+    "chrome", "google-chrome", "chromium", "chromium-browser",
+    "firefox", "firefox-esr", 
+    "msedge", "microsoft-edge",
+    "brave", "brave-browser",
+    "opera", "opera-browser",
+    "vivaldi", "vivaldi-stable",
+    "safari", "epiphany", "midori",
+    
     # Communication apps (can be used for cheating)
     "zoom", "microsoft teams", "teams", "skype", 
     "discord", "telegram", "whatsapp", "signal",
@@ -64,12 +67,13 @@ SUSPICIOUS_PROCESSES = {
     # Terminal emulators (suspicious but not always dangerous)
     "terminal", "iterm", "iterm2", "wsl", "wslhost",
     
-    # Scripting languages (could be used to run unauthorized code)
-    "python", "python3", "ruby", "perl", "php",
-    "node", "nodejs", "deno", "bun",
+    # IDEs and Code Editors (important to track)
+    "code", "code-insiders", "code-oss",  # VS Code
+    "sublime_text", "atom", "gedit", "nano", "vim", "vi",
     
-    # Browser incognito/private flags (detected via command line)
-    # Note: These will be detected in command line arguments, not process names
+    # Development tools
+    "java", "javac", "gcc", "g++", "clang", "clangd",
+    "docker", "docker-compose", "containerd",
 }
 
 DANGEROUS_PROCESSES = {
@@ -272,13 +276,13 @@ def _take_snapshot() -> dict[int, dict]:
             memory_mb = round((info["memory_info"].rss if info["memory_info"] else 0) / (1024 * 1024), 2)
             
             # Only include if:
-            # 1. Has notable CPU usage (> 1%)
-            # 2. Or uses significant memory (> 50MB)
-            # 3. Or is a known suspicious/dangerous process
+            # 1. Has notable CPU usage (> 0.5%) - lowered from 1%
+            # 2. Or uses significant memory (> 30MB) - lowered from 50MB
+            # 3. Or is a known suspicious/dangerous process (browsers, terminals, etc.)
             name_lower = (info["name"] or "").lower()
             is_notable = (
-                cpu > 1.0 or 
-                memory_mb > 50.0 or
+                cpu > 0.5 or 
+                memory_mb > 30.0 or
                 name_lower in DANGEROUS_PROCESSES or
                 name_lower in SUSPICIOUS_PROCESSES
             )
