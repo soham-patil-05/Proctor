@@ -171,20 +171,22 @@ def _check_ss_available() -> bool:
 def _resolve_ip(ip: str) -> Optional[str]:
     """Best-effort reverse DNS lookup with in-memory cache.
 
-    Returns the resolved hostname or *None* if lookup fails.
+    Returns the resolved hostname or the IP itself if lookup fails.
     """
     if ip in _SKIP_PRIVATE or not ip:
         return None
     if ip in _IP_CACHE:
         cached = _IP_CACHE[ip]
-        return cached if cached != ip else None
+        return cached if cached != ip else ip  # Return IP if that's all we have
     try:
         host, _, _ = socket.gethostbyaddr(ip)
         _IP_CACHE[ip] = host
         return host
     except (socket.herror, socket.gaierror, OSError):
-        _IP_CACHE[ip] = ip  # cache negative result
-        return None
+        # If reverse DNS fails, just return the IP
+        # We'll filter it later based on patterns
+        _IP_CACHE[ip] = ip
+        return ip
 
 
 def _domain_matches_suspicious(hostname: Optional[str]) -> bool:
@@ -199,11 +201,29 @@ def _domain_matches_suspicious(hostname: Optional[str]) -> bool:
 
 
 def _extract_root_domain(hostname: str) -> str:
-    """Extract the registrable root domain from a FQDN (last two labels)."""
+    """Extract the registrable root domain from a FQDN.
+    
+    Handles common TLDs and country codes properly.
+    Examples:
+        www.google.com -> google.com
+        mail.google.co.uk -> google.co.uk
+        api.github.com -> github.com
+    """
     parts = hostname.rstrip(".").split(".")
-    if len(parts) >= 2:
-        return ".".join(parts[-2:])
-    return hostname
+    if len(parts) < 2:
+        return hostname
+    
+    # Common country-code TLDs that should be kept together
+    cc_tlds = {'.co.uk', '.co.in', '.co.jp', '.co.au', '.com.au', '.org.uk', '.ac.uk', '.ac.in'}
+    
+    # Check if we have a country code TLD
+    if len(parts) >= 3:
+        last_two = '.'.join(parts[-2:])
+        if any(last_two.endswith(cc) for cc in cc_tlds):
+            return '.'.join(parts[-3:]) if len(parts) >= 3 else last_two
+    
+    # Standard case: last two labels
+    return '.'.join(parts[-2:])
 
 
 def _parse_ss_output(raw: str) -> List[SSConnection]:
@@ -529,9 +549,8 @@ def _collect_legacy() -> dict:
 def _collect_domains() -> None:
     """Scan ESTABLISHED TCP connections and aggregate domain counts.
     
-    This is the PRIMARY method for tracking visited websites.
-    Resolves IP addresses to domain names and counts connections.
-    Filters out infrastructure/CDN domains to show only actual websites.
+    Focuses on HTTPS (port 443) and HTTP (port 80) connections which represent
+    actual web browsing activity.
     """
     global _last_connections
     try:
@@ -549,31 +568,29 @@ def _collect_domains() -> None:
         remote_ip = raddr.ip
         remote_port = raddr.port
         
-        # Skip private/local IPs (they don't represent external websites)
-        if remote_ip.startswith(('127.', '192.168.', '10.', '172.')):
-            conn_key = (remote_ip, remote_port, c.pid)
-            current.add(conn_key)
-            continue
-            
         conn_key = (remote_ip, remote_port, c.pid)
         current.add(conn_key)
         
-        # Only count NEW connections (not seen in last scan)
-        if conn_key not in _last_connections:
+        # Only track NEW connections on web ports (80, 443, 8080, 8443)
+        if conn_key not in _last_connections and remote_port in [80, 443, 8080, 8443]:
+            # Skip private/local IPs
+            if remote_ip.startswith(('127.', '192.168.', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.')):
+                continue
+            
             domain = _resolve_ip(remote_ip)
             if domain:
+                # Try to extract a readable domain
                 root = _extract_root_domain(domain)
-                # Filter out infrastructure/CDN domains
-                # We only want actual websites the user visits
+                
+                # Filter out obvious infrastructure/CDN domains
                 if root and root not in _INFRASTRUCTURE_DOMAINS:
-                    # Also check if any infrastructure domain is in the full hostname
-                    is_infra = False
-                    for infra in _INFRASTRUCTURE_DOMAINS:
-                        if domain.endswith('.' + infra) or infra in domain:
-                            is_infra = True
-                            break
+                    # Additional check: skip if it looks like an infrastructure domain
+                    is_infra = any(infra in root.lower() for infra in [
+                        'akamai', 'cloudfront', 'amazonaws', 'azure', 
+                        'cloudflare', 'fastly', 'cdn', 'edge'
+                    ])
                     
-                    if not is_infra:
+                    if not is_infra and len(root) > 3:  # Skip very short domains
                         _domain_counter[root] += 1
 
     _last_connections = current
@@ -747,10 +764,11 @@ async def run(send_fn):
         except Exception as e:
             log.debug("Domain collection error: %s", e)
 
-        # Flush domain activity every 10 seconds
-        if now - last_domain_flush_ts >= 10:
+        # Flush domain activity every 5 seconds for faster updates
+        if now - last_domain_flush_ts >= 5:
             domain_data = _flush_domain_counter()
             if domain_data:
+                log.info(f"Collected {len(domain_data)} domain(s): {[d['domain'] for d in domain_data[:5]]}")
                 for entry in domain_data:
                     entry["risk_level"] = _classify_domain(entry["domain"])
 
