@@ -622,8 +622,8 @@ async def run(send_fn):
     *send_fn* is an ``async def send(event: dict)`` callback used to
     dispatch events to the WebSocket layer.
 
-    Runs Layer 1 (ss), Layer 2 (auditd), and legacy domain aggregation
-    concurrently, with graceful degradation if tools are unavailable.
+    Primary focus: Domain activity tracking
+    Secondary: Terminal tool detection (ss and auditd)
     """
     global _prev_info, _ss_available, _audit_available, _audit_file_pos
 
@@ -649,6 +649,7 @@ async def run(send_fn):
 
     last_snapshot_ts = 0.0
     last_ss_ts = 0.0
+    last_domain_flush_ts = 0.0
     _prev_info = None
 
     while True:
@@ -657,25 +658,55 @@ async def run(send_fn):
 
         # ── Layer 1: ss-based terminal tool detection ──
         if _ss_available and (now - last_ss_ts >= config.NETWORK_SS_INTERVAL):
-            new_conns = await loop.run_in_executor(None, _poll_ss)
-            for conn in new_conns:
-                event = _build_ss_event(conn)
-                await send_fn(event)
+            try:
+                new_conns = await loop.run_in_executor(None, _poll_ss)
+                for conn in new_conns:
+                    event = _build_ss_event(conn)
+                    await send_fn(event)
+            except Exception as e:
+                log.debug("ss polling error: %s", e)
             last_ss_ts = now
 
         # ── Layer 2: auditd log tailing ──
         if _audit_available:
-            audit_cmds = await loop.run_in_executor(None, _tail_audit_log)
-            for cmd in audit_cmds:
-                event = _build_audit_event(cmd)
-                await send_fn(event)
+            try:
+                audit_cmds = await loop.run_in_executor(None, _tail_audit_log)
+                for cmd in audit_cmds:
+                    event = _build_audit_event(cmd)
+                    await send_fn(event)
+            except Exception as e:
+                log.debug("auditd tailing error: %s", e)
 
-        # ── Legacy: domain aggregation + network snapshot ──
+        # ── Domain aggregation (main focus) ──
+        try:
+            await loop.run_in_executor(None, _collect_domains)
+        except Exception as e:
+            log.debug("Domain collection error: %s", e)
+
+        # Flush domain activity every 10 seconds
+        if now - last_domain_flush_ts >= 10:
+            domain_data = _flush_domain_counter()
+            if domain_data:
+                for entry in domain_data:
+                    entry["risk_level"] = _classify_domain(entry["domain"])
+
+                has_high = any(d["risk_level"] == "high" for d in domain_data)
+                await send_fn({
+                    "type": "domain_activity",
+                    "data": domain_data,
+                    "ts": time.time(),
+                    "meta": {
+                        "risk_level": "high" if has_high else "normal",
+                        "category": "network",
+                        "message": f"{len(domain_data)} domain(s) accessed",
+                    },
+                })
+            last_domain_flush_ts = now
+
+        # ── Legacy: network snapshot (IP info) ──
+        # Send less frequently (every 60 seconds)
         info = await loop.run_in_executor(None, _collect_legacy)
-        await loop.run_in_executor(None, _collect_domains)
-
-        # Legacy network_snapshot (DEPRECATED — kept for backward compat)
-        if now - last_snapshot_ts >= config.SNAPSHOT_INTERVAL or _prev_info is None:
+        if now - last_snapshot_ts >= 60 or _prev_info is None:
             await send_fn({
                 "type": "network_snapshot",
                 "data": info,
@@ -683,45 +714,13 @@ async def run(send_fn):
                 "meta": {
                     "risk_level": "low",
                     "category": "network",
-                    "message": "Network snapshot (legacy)",
+                    "message": "Network info snapshot",
                 },
             })
             last_snapshot_ts = now
-        else:
-            prev_conn = (_prev_info or {}).get("activeConnections", 0)
-            curr_conn = info.get("activeConnections", 0)
-            if abs(curr_conn - prev_conn) >= 3:
-                await send_fn({
-                    "type": "network_update",
-                    "data": info,
-                    "ts": time.time(),
-                    "meta": {
-                        "risk_level": "low",
-                        "category": "network",
-                        "message": "Network connections changed",
-                    },
-                })
-
-        # Domain activity events
-        domain_data = _flush_domain_counter()
-        if domain_data:
-            for entry in domain_data:
-                entry["risk_level"] = _classify_domain(entry["domain"])
-
-            has_high = any(d["risk_level"] == "high" for d in domain_data)
-            await send_fn({
-                "type": "domain_activity",
-                "data": domain_data,
-                "ts": time.time(),
-                "meta": {
-                    "risk_level": "high" if has_high else "normal",
-                    "category": "network",
-                    "message": f"{len(domain_data)} domain(s) accessed",
-                },
-            })
 
         _prev_info = info
 
         # Sleep at the shorter of the two poll intervals so ss fires on time
-        sleep_interval = config.NETWORK_SS_INTERVAL if _ss_available else config.NETWORK_POLL_INTERVAL
+        sleep_interval = min(config.NETWORK_SS_INTERVAL, 5)  # At least check every 5s
         await asyncio.sleep(sleep_interval)

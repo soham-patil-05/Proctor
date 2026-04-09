@@ -63,23 +63,43 @@ def _make_meta(device_info: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _collect_devices() -> dict[str, dict]:
-    """Return dict keyed by device path/name, with fields matching backend schema."""
+    """Return dict keyed by device path/name, with fields matching backend schema.
+    
+    Only collects USB storage devices (removable drives).
+    Filters out internal drives, network drives, and virtual drives.
+    """
     devices: dict[str, dict] = {}
     for part in psutil.disk_partitions(all=False):
+        # Skip non-removable drives
+        opts = part.opts.lower() if part.opts else ""
+        
+        # Only include removable/USB drives
+        # Check for common USB indicators
+        is_usb = (
+            "removable" in opts or 
+            part.device.startswith("/dev/sd") or  # SCSI/SATA USB drives
+            part.device.startswith("/dev/mmcblk") or  # SD cards
+            part.fstype.lower() in ("vfat", "exfat", "ntfs", "fuseblk")  # Common USB filesystems
+        )
+        
+        # Skip if not USB
+        if not is_usb:
+            continue
+            
+        # Additional check: skip if it looks like an internal drive
+        if part.mountpoint in ["/", "/boot", "/home", "/var", "/usr", "/tmp"]:
+            continue
+            
         usage = None
         try:
             usage = psutil.disk_usage(part.mountpoint)
         except (PermissionError, OSError):
             pass
-        # Classify: removable/loop → usb, otherwise → external
-        opts = part.opts.lower() if part.opts else ""
-        is_removable = "removable" in opts or part.device.startswith("/dev/sd")
-        dev_type = "usb" if is_removable else "external"
 
         dev_info = {
             "id": part.device,
             "name": f"{part.device} ({part.mountpoint})",
-            "type": dev_type,
+            "type": "usb",
             "metadata": {
                 "mountpoint": part.mountpoint,
                 "fstype": part.fstype,
@@ -128,9 +148,10 @@ async def run(send_fn):
         # Full snapshot periodically
         if now - last_snapshot_ts >= config.SNAPSHOT_INTERVAL or not _prev_devices:
             all_devs = list(curr.values())
+            # Only send USB devices (external array will be empty)
             snapshot_data = {
-                "usb": [d for d in all_devs if d["type"] == "usb"],
-                "external": [d for d in all_devs if d["type"] == "external"],
+                "usb": all_devs,
+                "external": [],
             }
             await send_fn({
                 "type": "devices_snapshot",
@@ -139,7 +160,7 @@ async def run(send_fn):
                 "meta": {
                     "risk_level": "high" if snapshot_data["usb"] else "low",
                     "category": "device",
-                    "message": f"{len(all_devs)} device(s) connected",
+                    "message": f"{len(all_devs)} USB device(s) connected",
                 },
             })
             last_snapshot_ts = now

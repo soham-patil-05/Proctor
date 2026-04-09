@@ -31,24 +31,55 @@ _prev_snapshot: dict[int, dict] = {}
 # ---------------------------------------------------------------------------
 
 SAFE_PROCESSES = {
-    "chrome", "firefox", "code", "explorer", "nautilus", "xfce4-panel",
-    "gnome-shell", "systemd", "svchost", "csrss", "dwm", "conhost",
-    "winlogon", "lsass", "services", "smss", "wininit", "taskhost",
-    "spoolsv", "searchindexer", "runtimebroker", "shellexperiencehost",
-    "sihost", "ctfmon", "fontdrvhost", "dllhost",
+    # System processes (Linux)
+    "systemd", "systemd-journal", "systemd-udevd", "systemd-logind", "systemd-resolved",
+    "systemd-timesyn", "dbus-daemon", "accounts-daemon", "udisksd", "polkitd",
+    "networkmanager", "wpa_supplicant", "bluetoothd", "cron", "atd", "sshd",
+    "rsyslogd", "cupsd", "avahi-daemon", "thermald", "irqbalance", 
+    "modemmanager", "switcheroo-control", "gdm3", "lightdm", "sddm",
+    
+    # System processes (Windows)
+    "svchost", "csrss", "dwm", "winlogon", "lsass", "services", "smss", 
+    "wininit", "taskhost", "taskhostw", "spoolsv", "searchindexer", 
+    "searchprotocolhost", "searchfilterhost", "runtimebroker", 
+    "shellexperiencehost", "sihost", "ctfmon", "fontdrvhost", "dllhost",
+    "lsaiso", "wmiprvse", "conhost", "compattelrunner", "moone", 
+    
+    # Common safe processes
+    "chrome", "firefox", "msedge", "brave", "opera", "vivaldi",  # Browsers
+    "code", "code-helper", "code-insiders",  # VS Code
+    "explorer", "nautilus", "dolphin", "thunar", "xfce4-panel", "gnome-shell",  # File managers/DE
+    
+    # IDE and dev tools (usually safe)
+    "node", "npm", "python", "python3", "java", "javac", "gcc", "g++",
+    "clang", "clangd", "cmake", "make", "git", "docker", "containerd",
 }
 
 SUSPICIOUS_PROCESSES = {
-    "anydesk", "teamviewer", "zoom", "discord", "skype", "telegram",
-    "slack", "microsoft teams", "teams", "rustdesk", "parsec",
-    "vnc", "vncserver", "vncviewer", "remotedesktop",
+    # Communication apps (can be used for cheating)
+    "zoom", "microsoft teams", "teams", "skype", 
+    "discord", "telegram", "whatsapp", "signal",
+    "slack", "webex", "gotomeeting",
+    
+    # Terminal emulators (suspicious but not always dangerous)
+    "terminal", "iterm", "iterm2", "wsl", "wslhost",
+    
+    # Scripting languages (could be used to run unauthorized code)
+    "python", "python3", "ruby", "perl", "php",
+    "node", "nodejs", "deno", "bun",
 }
 
 DANGEROUS_PROCESSES = {
-    "bash", "terminal", "python", "python3", "powershell", "cmd",
-    "sh", "zsh", "fish", "ksh", "csh", "node", "ruby", "perl",
-    "wsl", "mintty", "xterm", "konsole", "gnome-terminal",
+    # Remote access tools (high risk during exams)
+    "anydesk", "teamviewer", "rustdesk", "parsec",
+    "vnc", "vncserver", "vncviewer", "remotedesktop",
+    
+    # Terminal processes (only flag if actively used)
+    "bash", "zsh", "fish", "ksh", "csh", "sh",
+    "powershell", "pwsh", "cmd", "command",
+    "mintty", "xterm", "konsole", "gnome-terminal",
     "alacritty", "kitty", "iterm2", "hyper", "terminator",
+    "wt", "windowsterminal",
 }
 
 # Human-readable labels for known process names
@@ -129,17 +160,65 @@ def _make_meta(proc_info: dict, msg_override: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 def _take_snapshot() -> dict[int, dict]:
-    """Return dict of {pid: info} for all running user processes."""
+    """Return dict of {pid: info} for all running user processes.
+    
+    Filters out:
+    - System processes (root/system on Linux, SYSTEM/NETWORK SERVICE on Windows)
+    - Processes with very low CPU and memory usage
+    """
+    import getpass
+    import os
+    
     procs: dict[int, dict] = {}
+    current_user = None
+    try:
+        current_user = getpass.getuser()
+    except:
+        pass
+    
     for proc in psutil.process_iter(["pid", "name", "username", "cpu_percent", "memory_info", "status", "create_time"]):
         try:
             info = proc.info
+            
+            # Skip if we can't get the username
+            if not info.get("username"):
+                continue
+            
+            username = info["username"] or ""
+            
+            # Filter out system processes
+            # Linux: skip root processes (except current user)
+            # Windows: skip SYSTEM, NETWORK SERVICE, LOCAL SERVICE
+            if username.lower() in ["root", "system", "network service", "local service"]:
+                # Allow if it's actually the current user running as root
+                if current_user and current_user.lower() != "root":
+                    continue
+            
+            # Skip processes with very low resource usage (likely background)
+            cpu = round(info["cpu_percent"] or 0.0, 2)
+            memory_mb = round((info["memory_info"].rss if info["memory_info"] else 0) / (1024 * 1024), 2)
+            
+            # Only include if:
+            # 1. Has notable CPU usage (> 1%)
+            # 2. Or uses significant memory (> 50MB)
+            # 3. Or is a known suspicious/dangerous process
+            name_lower = (info["name"] or "").lower()
+            is_notable = (
+                cpu > 1.0 or 
+                memory_mb > 50.0 or
+                name_lower in DANGEROUS_PROCESSES or
+                name_lower in SUSPICIOUS_PROCESSES
+            )
+            
+            if not is_notable:
+                continue
+            
             procs[info["pid"]] = {
                 "pid": info["pid"],
                 "name": info["name"] or "unknown",
-                "user": info["username"] or "",
-                "cpu": round(info["cpu_percent"] or 0.0, 2),
-                "memory": round((info["memory_info"].rss if info["memory_info"] else 0) / (1024 * 1024), 2),
+                "user": username,
+                "cpu": cpu,
+                "memory": memory_mb,
                 "status": info["status"] or "unknown",
                 "started_at": info["create_time"],
             }

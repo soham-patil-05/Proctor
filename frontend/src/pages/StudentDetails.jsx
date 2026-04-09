@@ -297,7 +297,8 @@ export default function StudentDetails() {
     (p) => p.risk_level === 'medium' && p.status !== 'ended'
   );
 
-  const allDevices = [...(devices.usb || []), ...(devices.external || [])];
+  // Only show USB devices (ignore external)
+  const allDevices = devices.usb || [];
   const riskyDevices = allDevices.filter((d) => d.risk_level === 'high' || d.risk_level === 'medium');
   const highRiskDomains = domainActivity.filter((d) => d.risk_level === 'high');
   const highRiskTerminal = terminalEvents.filter((d) => d.risk_level === 'high');
@@ -365,11 +366,11 @@ export default function StudentDetails() {
 
   const renderDevicesSection = () => (
     <div className="space-y-4">
-      <SectionHeader icon={Usb} title="Connected Devices" count={allDevices.length} />
+      <SectionHeader icon={Usb} title="Connected USB Devices" count={allDevices.length} />
       {allDevices.length === 0 ? (
         <div className="text-center py-10">
           <Monitor className="h-10 w-10 mx-auto text-[var(--color-gray-300)] mb-3" />
-          <p className="text-sm text-[var(--color-gray-500)]">No devices connected</p>
+          <p className="text-sm text-[var(--color-gray-500)]">No USB devices connected</p>
         </div>
       ) : (
         <div className="space-y-3">
@@ -386,7 +387,7 @@ export default function StudentDetails() {
             >
               <div className="flex-1 min-w-0">
                 <p className="font-semibold text-sm text-[var(--color-gray-900)]">
-                  {device.readable_name || (device.device_type === 'usb' ? 'USB Device' : 'External Storage')}
+                  {device.readable_name || 'USB Storage Device'}
                 </p>
                 {device.message && (
                   <p className="text-xs text-[var(--color-gray-500)] mt-0.5">{device.message}</p>
