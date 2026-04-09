@@ -360,6 +360,7 @@ def _tail_audit_log() -> List[AuditCommand]:
     """Read new lines from the auditd log since last position.
 
     Returns a list of :class:`AuditCommand` for network-capable executables.
+    Only captures commands executed by real users (not system processes).
     """
     global _audit_file_pos
 
@@ -382,6 +383,16 @@ def _tail_audit_log() -> List[AuditCommand]:
     # We care about type=EXECVE lines that contain our monitored tool names
     for line in new_data.splitlines():
         if "type=EXECVE" not in line:
+            continue
+
+        # Skip system-initiated commands
+        # Filter out commands from cron, systemd, or other system services
+        if any(skip in line.lower() for skip in [
+            "exe=\"/usr/sbin/cron\"",
+            "exe=\"/lib/systemd/\"",
+            "exe=\"/usr/lib/systemd/\"",
+            "auid=4294967295",  # unset/unspecified audit UID (system)
+        ]):
             continue
 
         # Reconstruct command
@@ -501,7 +512,11 @@ def _collect_legacy() -> dict:
 
 
 def _collect_domains() -> None:
-    """Scan ESTABLISHED TCP connections and aggregate domain counts."""
+    """Scan ESTABLISHED TCP connections and aggregate domain counts.
+    
+    This is the PRIMARY method for tracking visited websites.
+    Resolves IP addresses to domain names and counts connections.
+    """
     global _last_connections
     try:
         conns = psutil.net_connections(kind="tcp")
@@ -517,13 +532,26 @@ def _collect_domains() -> None:
             continue
         remote_ip = raddr.ip
         remote_port = raddr.port
+        
+        # Skip private/local IPs
+        if remote_ip.startswith(('127.', '192.168.', '10.', '172.')):
+            # Still track but with lower priority
+            pass
+            
         conn_key = (remote_ip, remote_port, c.pid)
         current.add(conn_key)
+        
+        # Only count NEW connections (not seen in last scan)
         if conn_key not in _last_connections:
             domain = _resolve_ip(remote_ip)
             if domain:
                 root = _extract_root_domain(domain)
-                _domain_counter[root] += 1
+                # Skip common CDNs and infrastructure
+                if root and not any(skip in root for skip in [
+                    'akamai.net', 'cloudfront.net', 'azureedge.net',
+                    'googleusercontent.com', 'amazonaws.com'
+                ]):
+                    _domain_counter[root] += 1
 
     _last_connections = current
 

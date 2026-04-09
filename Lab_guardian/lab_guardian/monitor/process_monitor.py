@@ -67,6 +67,9 @@ SUSPICIOUS_PROCESSES = {
     # Scripting languages (could be used to run unauthorized code)
     "python", "python3", "ruby", "perl", "php",
     "node", "nodejs", "deno", "bun",
+    
+    # Browser incognito/private flags (detected via command line)
+    # Note: These will be detected in command line arguments, not process names
 }
 
 DANGEROUS_PROCESSES = {
@@ -84,39 +87,108 @@ DANGEROUS_PROCESSES = {
 
 # Human-readable labels for known process names
 PROCESS_LABELS = {
-    "anydesk": "Remote Access Tool",
-    "teamviewer": "Remote Access Tool",
-    "zoom": "Video Conferencing App",
-    "discord": "Communication App",
-    "skype": "Communication App",
-    "telegram": "Messaging App",
-    "slack": "Communication App",
-    "teams": "Video Conferencing App",
-    "bash": "Terminal Opened",
-    "terminal": "Terminal Opened",
+    "anydesk": "AnyDesk Remote Access",
+    "teamviewer": "TeamViewer Remote Access",
+    "zoom": "Zoom Video Conferencing",
+    "discord": "Discord Chat Application",
+    "skype": "Skype Communication",
+    "telegram": "Telegram Messenger",
+    "slack": "Slack Communication",
+    "teams": "Microsoft Teams",
+    "bash": "Bash Shell",
+    "terminal": "Terminal Emulator",
     "python": "Python Interpreter",
-    "python3": "Python Interpreter",
+    "python3": "Python 3 Interpreter",
     "powershell": "PowerShell Terminal",
+    "pwsh": "PowerShell 7+",
     "cmd": "Command Prompt",
-    "sh": "Shell Opened",
-    "zsh": "Shell Opened",
+    "command": "Windows Command Processor",
+    "sh": "Shell",
+    "zsh": "Z Shell",
+    "fish": "Fish Shell",
+    "ksh": "Korn Shell",
+    "csh": "C Shell",
     "node": "Node.js Runtime",
+    "nodejs": "Node.js Runtime",
     "ruby": "Ruby Interpreter",
     "perl": "Perl Interpreter",
-    "wsl": "Linux Subsystem",
+    "php": "PHP Interpreter",
+    "wsl": "Windows Subsystem for Linux",
+    "wslhost": "WSL Host Process",
+    "mintty": "MinTTY Terminal",
+    "xterm": "X Terminal",
+    "konsole": "KDE Console",
+    "gnome-terminal": "GNOME Terminal",
+    "alacritty": "Alacritty Terminal",
+    "kitty": "Kitty Terminal",
+    "iterm": "iTerm Terminal",
+    "iterm2": "iTerm2 Terminal",
+    "hyper": "Hyper Terminal",
+    "terminator": "Terminator Terminal",
+    "wt": "Windows Terminal",
+    "windowsterminal": "Windows Terminal",
+    "rustdesk": "RustDesk Remote Access",
+    "parsec": "Parsec Remote Desktop",
+    "vnc": "VNC Remote Access",
+    "vncserver": "VNC Server",
+    "vncviewer": "VNC Viewer",
+    "remotedesktop": "Remote Desktop",
+    "whatsapp": "WhatsApp Messenger",
+    "signal": "Signal Messenger",
+    "webex": "Cisco WebEx",
+    "gotomeeting": "GoToMeeting",
+    "deno": "Deno Runtime",
+    "bun": "Bun Runtime",
 }
 
 # CPU threshold for including unknown processes (percent)
 UNKNOWN_CPU_THRESHOLD = 5.0
 
+# Incognito/Private browsing indicators in command line
+INCOGNITO_FLAGS = {
+    "--incognito", "-incognito",  # Chrome
+    "--private", "-private", "-private-window",  # Firefox
+    "--inprivate", "-inprivate",  # Edge
+    "--private-browsing",  # Safari
+}
 
-def _classify_process(proc_info: dict) -> dict | None:
+
+def _check_incognito(proc) -> bool:
+    """Check if a browser process is running in incognito/private mode."""
+    try:
+        cmdline = proc.cmdline()
+        if not cmdline:
+            return False
+        
+        # Check if any command line argument matches incognito flags
+        cmdline_str = " ".join(cmdline).lower()
+        for flag in INCOGNITO_FLAGS:
+            if flag in cmdline_str:
+                return True
+        return False
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        return False
+
+
+def _classify_process(proc_info: dict, proc_obj=None) -> dict | None:
     """Classify a process and enrich with risk_level, category, label.
 
     Returns None if the process should be filtered out (safe / low priority).
     Returns the enriched dict otherwise.
     """
     name_lower = (proc_info.get("name") or "").lower()
+
+    # Check for incognito/private browsing
+    is_incognito = False
+    if proc_obj:
+        is_incognito = _check_incognito(proc_obj)
+    
+    if is_incognito:
+        proc_info["risk_level"] = "high"
+        proc_info["category"] = "incognito"
+        proc_info["label"] = f"{proc_info.get('name', 'Browser')} (Incognito/Private Mode)"
+        proc_info["is_incognito"] = True
+        return proc_info
 
     # Safe processes → skip
     if name_lower in SAFE_PROCESSES:
@@ -125,13 +197,14 @@ def _classify_process(proc_info: dict) -> dict | None:
     if name_lower in DANGEROUS_PROCESSES:
         proc_info["risk_level"] = "high"
         proc_info["category"] = "dangerous"
-        proc_info["label"] = PROCESS_LABELS.get(name_lower, "Dangerous Process")
+        # Use the actual process name from PROCESS_LABELS or fallback to the name
+        proc_info["label"] = PROCESS_LABELS.get(name_lower, proc_info.get("name", "Unknown Process"))
         return proc_info
 
     if name_lower in SUSPICIOUS_PROCESSES:
         proc_info["risk_level"] = "medium"
         proc_info["category"] = "suspicious"
-        proc_info["label"] = PROCESS_LABELS.get(name_lower, "Suspicious Application")
+        proc_info["label"] = PROCESS_LABELS.get(name_lower, proc_info.get("name", "Unknown Process"))
         return proc_info
 
     # Unknown binary — include only if CPU > threshold
@@ -139,7 +212,7 @@ def _classify_process(proc_info: dict) -> dict | None:
     if cpu >= UNKNOWN_CPU_THRESHOLD:
         proc_info["risk_level"] = "low"
         proc_info["category"] = "unknown"
-        proc_info["label"] = "Unknown Process (High CPU)"
+        proc_info["label"] = proc_info.get("name", "Unknown Process")
         return proc_info
 
     # Low CPU unknown process → skip
@@ -227,17 +300,18 @@ def _take_snapshot() -> dict[int, dict]:
     return procs
 
 
-def _filter_and_classify(snapshot: dict[int, dict]) -> list[dict]:
+def _filter_and_classify(snapshot: dict[int, dict], proc_map: dict[int, any] = None) -> list[dict]:
     """Apply classification filter and return only relevant processes."""
     result = []
-    for proc in snapshot.values():
-        classified = _classify_process(dict(proc))  # copy so we don't mutate state
+    for pid, proc in snapshot.items():
+        proc_obj = proc_map.get(pid) if proc_map else None
+        classified = _classify_process(dict(proc), proc_obj)  # copy so we don't mutate state
         if classified is not None:
             result.append(classified)
     return result
 
 
-def _diff(prev: dict[int, dict], curr: dict[int, dict]) -> list[dict]:
+def _diff(prev: dict[int, dict], curr: dict[int, dict], prev_map: dict = None, curr_map: dict = None) -> list[dict]:
     """Compute delta events between two snapshots (with classification)."""
     events: list[dict] = []
 
@@ -245,7 +319,8 @@ def _diff(prev: dict[int, dict], curr: dict[int, dict]) -> list[dict]:
     gone_pids = set(prev) - set(curr)
 
     for pid in new_pids:
-        classified = _classify_process(dict(curr[pid]))
+        proc_obj = curr_map.get(pid) if curr_map else None
+        classified = _classify_process(dict(curr[pid]), proc_obj)
         if classified is not None:
             events.append({
                 "type": "process_new",
@@ -255,7 +330,8 @@ def _diff(prev: dict[int, dict], curr: dict[int, dict]) -> list[dict]:
 
     for pid in gone_pids:
         prev_proc = prev[pid]
-        classified = _classify_process(dict(prev_proc))
+        proc_obj = prev_map.get(pid) if prev_map else None
+        classified = _classify_process(dict(prev_proc), proc_obj)
         if classified is not None:
             events.append({
                 "type": "process_end",
@@ -268,7 +344,8 @@ def _diff(prev: dict[int, dict], curr: dict[int, dict]) -> list[dict]:
         cpu_delta = abs(c["cpu"] - p["cpu"])
         mem_delta = abs(c["memory"] - p["memory"])
         if cpu_delta >= config.CPU_CHANGE_THRESHOLD or mem_delta >= config.MEM_CHANGE_THRESHOLD:
-            classified = _classify_process(dict(c))
+            proc_obj = curr_map.get(pid) if curr_map else None
+            classified = _classify_process(dict(c), proc_obj)
             if classified is not None:
                 events.append({
                     "type": "process_update",
@@ -289,14 +366,23 @@ async def run(send_fn):
 
     log.info("Process monitor started")
     last_snapshot_ts = 0.0
+    proc_map = {}  # Keep track of process objects for incognito detection
 
     while True:
         now = time.monotonic()
         curr = _take_snapshot()
+        
+        # Build a map of current process objects for incognito detection
+        curr_proc_map = {}
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                curr_proc_map[proc.info["pid"]] = proc
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
         # Full snapshot on first run or every SNAPSHOT_INTERVAL
         if now - last_snapshot_ts >= config.SNAPSHOT_INTERVAL or not _prev_snapshot:
-            filtered = _filter_and_classify(curr)
+            filtered = _filter_and_classify(curr, curr_proc_map)
 
             high_count = sum(1 for p in filtered if p.get("risk_level") == "high")
             med_count = sum(1 for p in filtered if p.get("risk_level") == "medium")
@@ -315,10 +401,12 @@ async def run(send_fn):
             last_snapshot_ts = now
         else:
             # Delta events
-            deltas = _diff(_prev_snapshot, curr)
+            prev_proc_map = proc_map.copy()
+            deltas = _diff(_prev_snapshot, curr, prev_proc_map, curr_proc_map)
             for evt in deltas:
                 evt["ts"] = time.time()
                 await send_fn(evt)
 
         _prev_snapshot = curr
+        proc_map = curr_proc_map
         await asyncio.sleep(config.DELTA_INTERVAL)
