@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from . import ws_client
-from .monitor import process_monitor, device_monitor, network_monitor
+from .monitor import process_monitor, device_monitor, network_monitor, browser_monitor
 
 log = logging.getLogger("lab_guardian.dispatcher")
 
@@ -36,6 +36,7 @@ async def run(session_id: str, student_id: str, token: str):
         asyncio.create_task(process_monitor.run(enqueue), name="proc"),
         asyncio.create_task(device_monitor.run(enqueue), name="dev"),
         asyncio.create_task(network_monitor.run(enqueue), name="net"),
+        asyncio.create_task(browser_monitor.run(enqueue), name="browser"),
         asyncio.create_task(drain(), name="drain"),
     ]
 
