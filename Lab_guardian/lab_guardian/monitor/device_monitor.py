@@ -11,6 +11,7 @@ Emits:
 
 import asyncio
 import logging
+import os
 import platform
 import time
 
@@ -38,10 +39,21 @@ def _classify_device(device_info: dict) -> dict:
     Original fields are preserved (non-destructive).
     """
     dev_type = device_info.get("type", "")
+    vendor = device_info.get("metadata", {}).get("vendor", "")
+    model = device_info.get("metadata", {}).get("model", "")
+    
+    # Build a readable name from vendor/model if available
+    if vendor or model:
+        readable = f"{vendor} {model}".strip()
+        if not readable:
+            readable = "USB Storage Device"
+    else:
+        readable = "USB Storage Device"
+    
     if dev_type == "usb":
-        device_info["readable_name"] = "USB Storage Device"
+        device_info["readable_name"] = readable
         device_info["risk_level"] = "high"
-        device_info["message"] = "External USB device connected"
+        device_info["message"] = f"{readable} connected"
     else:
         device_info["readable_name"] = "External Storage"
         device_info["risk_level"] = "medium"
@@ -56,6 +68,107 @@ def _make_meta(device_info: dict) -> dict:
         "category": device_info.get("type", "device"),
         "message": device_info.get("message", "Device event"),
     }
+
+
+def _get_usb_vendor_model(device_path: str) -> tuple[str, str]:
+    """Extract vendor and model from sysfs for a USB device.
+    
+    Args:
+        device_path: Device path like /dev/sdb
+        
+    Returns:
+        Tuple of (vendor, model) strings
+    """
+    vendor = ""
+    model = ""
+    
+    try:
+        # Extract device name (e.g., sdb from /dev/sdb)
+        dev_name = device_path.split("/")[-1] if device_path else ""
+        if not dev_name:
+            return vendor, model
+        
+        # Try to read from sysfs
+        # Path: /sys/block/sdb/device/vendor
+        vendor_path = f"/sys/block/{dev_name}/device/vendor"
+        model_path = f"/sys/block/{dev_name}/device/model"
+        
+        if os.path.exists(vendor_path):
+            with open(vendor_path, 'r') as f:
+                vendor = f.read().strip()
+        
+        if os.path.exists(model_path):
+            with open(model_path, 'r') as f:
+                model = f.read().strip()
+        
+        # Clean up vendor/model strings
+        vendor = vendor.replace('"', '').strip()
+        model = model.replace('"', '').strip()
+        
+        # Map common vendor IDs to brand names
+        vendor_map = {
+            '0x0781': 'SanDisk',
+            '0x090c': 'Silicon Motion',
+            '0x1307': 'Transcend',
+            '0x0951': 'Kingston',
+            '0x04e8': 'Samsung',
+            '0x0480': 'Toshiba',
+            '0x0718': 'Imation',
+            '0x058f': 'Alcor Micro',
+            '0x0930': 'Toshiba',
+            '0x0bda': 'Realtek',
+            '0x125f': 'A-DATA',
+            '0x1f75': 'InnoDisk',
+            '0x0cf2': 'ENE Technology',
+            '0x05dc': 'Lexar',
+            '0x2006': 'ADATA',
+            '0x14cd': 'Super Top',
+            '0x0409': 'NEC',
+            '0x067b': 'Prolific Technology',
+            '0x1b1c': 'Corsair',
+            '0x1058': 'Western Digital',
+            '0x0bc2': 'Seagate',
+            '0x045b': 'Hitachi',
+            '0x03f0': 'HP',
+            '0x046d': 'Logitech',
+            '0x04b3': 'IBM',
+            '0x04f2': 'Chicony',
+            '0x062a': 'MosArt Semiconductor',
+            '0x0764': 'Cyber Power',
+            '0x0781': 'SanDisk',
+            '0x08bb': 'Texas Instruments',
+            '0x0923': 'IC Media',
+            '0x0a5c': 'Broadcom',
+            '0x0b95': 'ASIX Electronics',
+            '0x0c0b': 'VIA Technologies',
+            '0x1043': 'ASUS',
+            '0x10d6': 'Actions Semiconductor',
+            '0x13fe': 'Kingston',
+            '0x14cd': 'Super Top',
+            '0x1516': 'Compal Electronics',
+            '0x152d': 'JMicron',
+            '0x15d9': 'Trust',
+            '0x17ef': 'Lenovo',
+            '0x18a5': 'Verbatim',
+            '0x1b1c': 'Corsair',
+            '0x2109': 'VIA Labs',
+            '0x2207': 'Rockchip',
+            '0x24ae': 'Rapoo',
+            '0x25a7': 'FAE',
+            '0x2717': 'Xiaomi',
+            '0x2940': 'OEM',
+            '0x2cb7': 'FireFly',
+            '0x3318': 'OEM',
+        }
+        
+        # If vendor is a hex ID, try to map it
+        if vendor.startswith('0x') and vendor.lower() in vendor_map:
+            vendor = vendor_map[vendor.lower()]
+        
+    except Exception as e:
+        log.debug(f"Failed to read USB vendor/model for {device_path}: {e}")
+    
+    return vendor, model
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +220,14 @@ def _collect_devices() -> dict[str, dict]:
                 "used_gb": round(usage.used / (1024 ** 3), 2) if usage else None,
             },
         }
+        
+        # Try to get USB vendor/model information
+        vendor, model = _get_usb_vendor_model(part.device)
+        if vendor:
+            dev_info["metadata"]["vendor"] = vendor
+        if model:
+            dev_info["metadata"]["model"] = model
+        
         # Enrich with classification
         _classify_device(dev_info)
         devices[part.device] = dev_info

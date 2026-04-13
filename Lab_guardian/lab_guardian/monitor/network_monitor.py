@@ -1,25 +1,21 @@
-"""network_monitor.py — Comprehensive network activity monitoring.
+"""network_monitor.py — Terminal command monitoring.
 
-Three detection layers run concurrently:
+Two detection layers run concurrently:
 
   Layer 1 — ``ss -tnp`` polling (no root required)
       Detects terminal tools (curl, wget, git, ssh …) making live TCP
-      connections and resolves remote IPs to hostnames.
+      connections.
 
   Layer 2 — ``auditd`` log tailing (optional, requires root / read access)
       Parses EXECVE audit records to capture full command + arguments for
       network-capable executables.  Skipped gracefully when the audit log
       is unreadable.
 
-  Legacy — ``psutil``-based domain aggregation (preserved for backward compat)
-      Counts unique domain connections and classifies them by risk.
+Note: Browser history is now handled by browser_history.py module.
 
 Emits:
   • terminal_request   – Layer 1: terminal tool detected via ss
   • terminal_command   – Layer 2: full command captured via auditd
-  • domain_activity    – Legacy:  aggregated domain request counts
-  • network_snapshot   – Legacy:  full interface / connection list
-  • network_update     – Legacy:  notable connection count change
 """
 
 import asyncio
@@ -126,29 +122,9 @@ _audit_file_pos: int = 0
 _audit_available: Optional[bool] = None
 _seen_audit_keys: Set[str] = set()  # dedup by (timestamp + command hash)
 
-# Legacy
-_prev_info: Optional[dict] = None
-_domain_counter: dict = defaultdict(int)
-_last_connections: Set[tuple] = set()
-
-# Reverse DNS cache
+# Reverse DNS cache (only used for ss terminal detection)
 _SKIP_PRIVATE: Set[str] = {"127.0.0.1", "0.0.0.0", "::1", "::"}
 _IP_CACHE: dict = {}
-
-# Infrastructure/CDN domains to filter out (not actual websites users visit)
-_INFRASTRUCTURE_DOMAINS: Set[str] = {
-    '1e100.net',  # Google infrastructure
-    'google.com',  # Will be caught by specific Google services
-    'gstatic.com', 'ggpht.com', 'ytimg.com',  # Google static content
-    'akamai.net', 'akamaiedge.net', 'akamaihd.net',
-    'cloudfront.net', 'amazonaws.com', 'awsstatic.com',
-    'azureedge.net', 'azurewebsites.net', 'microsoftonline.com',
-    'facebook.com', 'fbcdn.net',  # Facebook CDN
-    'twitter.com', 'twimg.com',
-    'cdn.jsdelivr.net', 'unpkg.com', 'cdnjs.cloudflare.com',
-    'googleusercontent.com', 'githubusercontent.com',
-    'appspot.com', 'blogspot.com',
-}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -166,64 +142,6 @@ def _check_ss_available() -> bool:
         return True
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
-
-
-def _resolve_ip(ip: str) -> Optional[str]:
-    """Best-effort reverse DNS lookup with in-memory cache.
-
-    Returns the resolved hostname or the IP itself if lookup fails.
-    """
-    if ip in _SKIP_PRIVATE or not ip:
-        return None
-    if ip in _IP_CACHE:
-        cached = _IP_CACHE[ip]
-        return cached if cached != ip else ip  # Return IP if that's all we have
-    try:
-        host, _, _ = socket.gethostbyaddr(ip)
-        _IP_CACHE[ip] = host
-        return host
-    except (socket.herror, socket.gaierror, OSError):
-        # If reverse DNS fails, just return the IP
-        # We'll filter it later based on patterns
-        _IP_CACHE[ip] = ip
-        return ip
-
-
-def _domain_matches_suspicious(hostname: Optional[str]) -> bool:
-    """Check if *hostname* (or any parent domain) matches the suspicious list."""
-    if hostname is None:
-        return False
-    h = hostname.lower()
-    for sus in SUSPICIOUS_TERMINAL_DOMAINS:
-        if h == sus or h.endswith("." + sus):
-            return True
-    return False
-
-
-def _extract_root_domain(hostname: str) -> str:
-    """Extract the registrable root domain from a FQDN.
-    
-    Handles common TLDs and country codes properly.
-    Examples:
-        www.google.com -> google.com
-        mail.google.co.uk -> google.co.uk
-        api.github.com -> github.com
-    """
-    parts = hostname.rstrip(".").split(".")
-    if len(parts) < 2:
-        return hostname
-    
-    # Common country-code TLDs that should be kept together
-    cc_tlds = {'.co.uk', '.co.in', '.co.jp', '.co.au', '.com.au', '.org.uk', '.ac.uk', '.ac.in'}
-    
-    # Check if we have a country code TLD
-    if len(parts) >= 3:
-        last_two = '.'.join(parts[-2:])
-        if any(last_two.endswith(cc) for cc in cc_tlds):
-            return '.'.join(parts[-3:]) if len(parts) >= 3 else last_two
-    
-    # Standard case: last two labels
-    return '.'.join(parts[-2:])
 
 
 def _parse_ss_output(raw: str) -> List[SSConnection]:
@@ -546,78 +464,6 @@ def _collect_legacy() -> dict:
     }
 
 
-def _collect_domains() -> None:
-    """Scan ESTABLISHED TCP connections and aggregate domain counts.
-    
-    Focuses on HTTPS (port 443) and HTTP (port 80) connections which represent
-    actual web browsing activity.
-    """
-    global _last_connections
-    try:
-        conns = psutil.net_connections(kind="tcp")
-    except (psutil.AccessDenied, OSError):
-        return
-
-    current: set = set()
-    for c in conns:
-        if c.status != "ESTABLISHED":
-            continue
-        raddr = c.raddr
-        if not raddr:
-            continue
-        remote_ip = raddr.ip
-        remote_port = raddr.port
-        
-        conn_key = (remote_ip, remote_port, c.pid)
-        current.add(conn_key)
-        
-        # Only track NEW connections on web ports (80, 443, 8080, 8443)
-        if conn_key not in _last_connections and remote_port in [80, 443, 8080, 8443]:
-            # Skip private/local IPs
-            if remote_ip.startswith(('127.', '192.168.', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.')):
-                continue
-            
-            domain = _resolve_ip(remote_ip)
-            if domain:
-                # Try to extract a readable domain
-                root = _extract_root_domain(domain)
-                
-                # Filter out obvious infrastructure/CDN domains
-                if root and root not in _INFRASTRUCTURE_DOMAINS:
-                    # Additional check: skip if it looks like an infrastructure domain
-                    is_infra = any(infra in root.lower() for infra in [
-                        'akamai', 'cloudfront', 'amazonaws', 'azure', 
-                        'cloudflare', 'fastly', 'cdn', 'edge'
-                    ])
-                    
-                    if not is_infra and len(root) > 3:  # Skip very short domains
-                        _domain_counter[root] += 1
-
-    _last_connections = current
-
-
-def _flush_domain_counter() -> list:
-    """Return accumulated domain counts and reset."""
-    global _domain_counter
-    if not _domain_counter:
-        return []
-    result = [
-        {"domain": d, "count": c}
-        for d, c in sorted(_domain_counter.items(), key=lambda x: -x[1])
-    ]
-    _domain_counter = defaultdict(int)
-    return result
-
-
-def _classify_domain(domain: str) -> str:
-    """Return risk level for a domain."""
-    if domain.lower() in _HIGH_RISK_DOMAINS:
-        return "high"
-    if domain.lower() in SUSPICIOUS_TERMINAL_DOMAINS:
-        return "medium"
-    return "normal"
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Event builders
 # ═══════════════════════════════════════════════════════════════════════════
@@ -729,8 +575,6 @@ async def run(send_fn):
 
     last_snapshot_ts = 0.0
     last_ss_ts = 0.0
-    last_domain_flush_ts = 0.0
-    _prev_info = None
 
     while True:
         now = time.monotonic()
@@ -758,37 +602,10 @@ async def run(send_fn):
             except Exception as e:
                 log.debug("auditd tailing error: %s", e)
 
-        # ── Domain aggregation (main focus) ──
-        try:
-            await loop.run_in_executor(None, _collect_domains)
-        except Exception as e:
-            log.debug("Domain collection error: %s", e)
-
-        # Flush domain activity every 5 seconds for faster updates
-        if now - last_domain_flush_ts >= 5:
-            domain_data = _flush_domain_counter()
-            if domain_data:
-                log.info(f"Collected {len(domain_data)} domain(s): {[d['domain'] for d in domain_data[:5]]}")
-                for entry in domain_data:
-                    entry["risk_level"] = _classify_domain(entry["domain"])
-
-                has_high = any(d["risk_level"] == "high" for d in domain_data)
-                await send_fn({
-                    "type": "domain_activity",
-                    "data": domain_data,
-                    "ts": time.time(),
-                    "meta": {
-                        "risk_level": "high" if has_high else "normal",
-                        "category": "network",
-                        "message": f"{len(domain_data)} domain(s) accessed",
-                    },
-                })
-            last_domain_flush_ts = now
-
-        # ── Legacy: network snapshot (IP info) ──
+        # ── Network snapshot (IP info) ──
         # Send less frequently (every 60 seconds)
         info = await loop.run_in_executor(None, _collect_legacy)
-        if now - last_snapshot_ts >= 60 or _prev_info is None:
+        if now - last_snapshot_ts >= 60:
             await send_fn({
                 "type": "network_snapshot",
                 "data": info,
@@ -800,8 +617,6 @@ async def run(send_fn):
                 },
             })
             last_snapshot_ts = now
-
-        _prev_info = info
 
         # Sleep at the shorter of the two poll intervals so ss fires on time
         sleep_interval = min(config.NETWORK_SS_INTERVAL, 5)  # At least check every 5s

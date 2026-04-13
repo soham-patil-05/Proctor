@@ -447,13 +447,9 @@ export default function StudentDetails() {
     </div>
   );
 
-  /* ── Section: Network (Top Websites) ──────────────────────── */
+  /* ── Section: Network (Browser History) ──────────────────────── */
 
   const renderNetworkSection = () => {
-    const sortedDomains = [...domainActivity].sort(
-      (a, b) => (b.request_count || 0) - (a.request_count || 0)
-    );
-
     const formatUrl = (url) => {
       try {
         const urlObj = new URL(url);
@@ -470,92 +466,50 @@ export default function StudentDetails() {
     };
 
     return (
-      <div className="space-y-6">
-        {/* Browser History - Full URLs */}
-        <div className="space-y-3">
-          <SectionHeader icon={History} title="Browser History" count={browserHistory.length} />
-          {browserHistory.length === 0 ? (
-            <div className="text-center py-8 bg-[var(--color-gray-50)] rounded-lg">
-              <History className="h-8 w-8 mx-auto text-[var(--color-gray-300)] mb-2" />
-              <p className="text-sm text-[var(--color-gray-500)]">No browser history available</p>
-              <p className="text-xs text-[var(--color-gray-400)] mt-1">Supports Chrome, Firefox, Edge, Brave</p>
-            </div>
-          ) : (
-            <div className="space-y-2 max-h-96 overflow-y-auto">
-              {browserHistory.slice(0, 50).map((entry, index) => (
-                <div
-                  key={entry.url || index}
-                  className="flex items-start justify-between p-3 rounded-lg bg-[var(--color-gray-50)] hover:bg-[var(--color-gray-100)] transition-all duration-200"
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm font-medium text-[var(--color-gray-900)] truncate">
-                      {entry.title || formatUrl(entry.url)}
-                    </p>
-                    <p className="text-xs text-[var(--color-blue-600)] mt-0.5 truncate">
-                      {entry.url}
-                    </p>
-                    <div className="flex items-center gap-2 mt-1">
-                      <span className="text-xs text-[var(--color-gray-500)]">
-                        {entry.browser}
-                      </span>
-                      <span className="text-xs text-[var(--color-gray-400)]">•</span>
-                      <span className="text-xs text-[var(--color-gray-500)]">
-                        Visited: {formatTime(entry.last_visited)}
-                      </span>
-                      {entry.visit_count > 1 && (
-                        <>
-                          <span className="text-xs text-[var(--color-gray-400)]">•</span>
-                          <span className="text-xs text-[var(--color-gray-500)]">
-                            {entry.visit_count} visits
-                          </span>
-                        </>
-                      )}
-                    </div>
+      <div className="space-y-3">
+        <SectionHeader icon={History} title="Browser History" count={browserHistory.length} />
+        {browserHistory.length === 0 ? (
+          <div className="text-center py-8 bg-[var(--color-gray-50)] rounded-lg">
+            <History className="h-8 w-8 mx-auto text-[var(--color-gray-300)] mb-2" />
+            <p className="text-sm text-[var(--color-gray-500)]">No browser history available</p>
+            <p className="text-xs text-[var(--color-gray-400)] mt-1">Supports Chrome, Firefox, Edge, Brave</p>
+          </div>
+        ) : (
+          <div className="space-y-2 max-h-[600px] overflow-y-auto">
+            {browserHistory.map((entry, index) => (
+              <div
+                key={entry.url || index}
+                className="flex items-start justify-between p-3 rounded-lg bg-[var(--color-gray-50)] hover:bg-[var(--color-gray-100)] transition-all duration-200"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-[var(--color-gray-900)] truncate">
+                    {entry.title || formatUrl(entry.url)}
+                  </p>
+                  <p className="text-xs text-[var(--color-blue-600)] mt-0.5 truncate">
+                    {entry.url}
+                  </p>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="text-xs text-[var(--color-gray-500)]">
+                      {entry.browser}
+                    </span>
+                    <span className="text-xs text-[var(--color-gray-400)]">•</span>
+                    <span className="text-xs text-[var(--color-gray-500)]">
+                      Visited: {formatTime(entry.last_visited)}
+                    </span>
+                    {entry.visit_count > 1 && (
+                      <>
+                        <span className="text-xs text-[var(--color-gray-400)]">•</span>
+                        <span className="text-xs text-[var(--color-gray-500)]">
+                          {entry.visit_count} visits
+                        </span>
+                      </>
+                    )}
                   </div>
                 </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Domain Activity - Summary */}
-        <div className="space-y-3">
-          <SectionHeader icon={Globe} title="Top Domains Accessed" count={sortedDomains.length} />
-          {sortedDomains.length === 0 ? (
-            <div className="text-center py-8">
-              <Globe className="h-8 w-8 mx-auto text-[var(--color-gray-300)] mb-2" />
-              <p className="text-sm text-[var(--color-gray-500)]">No domain activity recorded</p>
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {sortedDomains.slice(0, 20).map((entry) => {
-                const risk = entry.risk_level || classifyDomain(entry.domain);
-                return (
-                  <div
-                    key={entry.domain}
-                    className={`flex items-center justify-between p-3 rounded-lg transition-all duration-200 ${
-                      risk === 'high'
-                        ? 'bg-red-50 border border-[var(--color-error)] border-opacity-30'
-                        : 'bg-[var(--color-gray-50)] hover:bg-[var(--color-gray-100)]'
-                    }`}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium text-[var(--color-gray-900)] truncate">
-                        {entry.domain}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3 ml-4 shrink-0">
-                      <span className="text-xs text-[var(--color-gray-500)]">
-                        {entry.request_count} request{entry.request_count !== 1 ? 's' : ''}
-                      </span>
-                      <RiskBadge level={risk} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     );
   };
