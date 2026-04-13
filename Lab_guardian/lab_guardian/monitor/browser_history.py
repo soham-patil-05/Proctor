@@ -21,23 +21,28 @@ log = logging.getLogger("lab_guardian.monitor.browser_history")
 # Browser history database locations
 BROWSER_PATHS = {
     'chrome': {
-        'linux': '~/.config/google-chrome/Default/History',
+        'linux': ['~/.config/google-chrome/Default/History'],
+        'windows': ['~/AppData/Local/Google/Chrome/User Data/Default/History'],
         'name': 'Google Chrome'
     },
     'chromium': {
-        'linux': '~/.config/chromium/Default/History',
+        'linux': ['~/.config/chromium/Default/History', '~/snap/chromium/common/chromium/Default/History'],
+        'windows': ['~/AppData/Local/Chromium/User Data/Default/History'],
         'name': 'Chromium'
     },
     'brave': {
-        'linux': '~/.config/BraveSoftware/Brave-Browser/Default/History',
+        'linux': ['~/.config/BraveSoftware/Brave-Browser/Default/History', '~/snap/brave/common/.config/BraveSoftware/Brave-Browser/Default/History'],
+        'windows': ['~/AppData/Local/BraveSoftware/Brave-Browser/User Data/Default/History'],
         'name': 'Brave'
     },
     'edge': {
-        'linux': '~/.config/microsoft-edge/Default/History',
+        'linux': ['~/.config/microsoft-edge/Default/History'],
+        'windows': ['~/AppData/Local/Microsoft/Edge/User Data/Default/History'],
         'name': 'Microsoft Edge'
     },
     'firefox': {
-        'linux': '~/.mozilla/firefox/*/places.sqlite',
+        'linux': ['~/.mozilla/firefox/*/places.sqlite', '~/snap/firefox/common/.mozilla/firefox/*/places.sqlite'],
+        'windows': ['~/AppData/Roaming/Mozilla/Firefox/Profiles/*/places.sqlite'],
         'name': 'Mozilla Firefox'
     }
 }
@@ -45,21 +50,28 @@ BROWSER_PATHS = {
 
 def _get_browser_db_path(browser_key: str) -> List[str]:
     """Get the database path(s) for a browser."""
+    import platform
     browser_info = BROWSER_PATHS.get(browser_key, {})
-    path_template = browser_info.get('linux', '')
     
-    if not path_template:
-        return []
-    
-    # Expand home directory
-    path = os.path.expanduser(path_template)
-    
-    # Handle glob patterns (for Firefox with random profile names)
-    if '*' in path:
-        from glob import glob
-        return glob(path)
-    
-    return [path] if os.path.exists(path) else []
+    os_name = platform.system().lower()
+    if 'windows' in os_name:
+        path_templates = browser_info.get('windows', [])
+    else:
+        path_templates = browser_info.get('linux', [])
+        
+    if not isinstance(path_templates, list):
+        path_templates = [path_templates] if path_templates else []
+        
+    results = []
+    from glob import glob
+    for template in path_templates:
+        path = os.path.expanduser(template)
+        if '*' in path:
+            results.extend(glob(path))
+        elif os.path.exists(path):
+            results.append(path)
+            
+    return results
 
 
 def _read_chrome_history(db_path: str, since_timestamp: float = None) -> List[Dict]:
