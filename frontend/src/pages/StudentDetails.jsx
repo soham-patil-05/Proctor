@@ -480,8 +480,8 @@ export default function StudentDetails() {
         {browserHistory.length === 0 ? (
           <div className="text-center py-8 bg-[var(--color-gray-50)] rounded-lg">
             <History className="h-8 w-8 mx-auto text-[var(--color-gray-300)] mb-2" />
-            <p className="text-sm text-[var(--color-gray-500)]">No browser history available</p>
-            <p className="text-xs text-[var(--color-gray-400)] mt-1">Supports Chrome, Firefox, Edge, Brave</p>
+            <p className="text-sm text-[var(--color-gray-500)]">No browsing activity since session started</p>
+            <p className="text-xs text-[var(--color-gray-400)] mt-1">Monitoring Chrome, Firefox, Edge, Brave</p>
           </div>
         ) : (
           <div className="space-y-2 max-h-[600px] overflow-y-auto">

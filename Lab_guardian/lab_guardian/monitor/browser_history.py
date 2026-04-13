@@ -232,30 +232,33 @@ def scan_browser_history(since_timestamp: float = None) -> List[Dict]:
     return all_urls
 
 
-# Track last scan time
+# Track when the agent started
+_agent_start_time = 0
 _last_scan_time = 0
 _last_urls = []
-_first_scan = True
+
+
+def initialize_agent_start_time():
+    """Set the agent start time. Call this when the agent first starts."""
+    global _agent_start_time
+    _agent_start_time = time.time()
+    log.info(f"Browser history monitor will track URLs visited after: {time.ctime(_agent_start_time)}")
 
 
 def get_new_history() -> List[Dict]:
-    """Get browser history URLs.
-    
-    On first scan: Returns ALL URLs from history
-    On subsequent scans: Returns ALL URLs (refreshed)
+    """Get browser history URLs visited AFTER agent started.
     
     Returns:
-        List of URL entries
+        List of URL entries visited since agent started
     """
-    global _last_scan_time, _last_urls, _first_scan
+    global _last_scan_time, _last_urls
     
     try:
-        # Always scan ALL URLs (don't filter by timestamp)
-        current_urls = scan_browser_history(since_timestamp=None)
+        # Only get URLs visited after agent started
+        current_urls = scan_browser_history(since_timestamp=_agent_start_time)
         
         # Update scan time
         _last_scan_time = time.time()
-        _first_scan = False
         
         _last_urls = current_urls
         return current_urls

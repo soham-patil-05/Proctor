@@ -33,6 +33,9 @@ async def run(session_id: str, student_id: str, token: str):
     async def browser_history_monitor(send_fn):
         """Monitor browser history for visited URLs."""
         import time
+        
+        # Initialize the agent start time - only track URLs from this point forward
+        browser_history.initialize_agent_start_time()
         log.info("Browser history monitor started")
         
         while True:
@@ -48,11 +51,11 @@ async def run(session_id: str, student_id: str, token: str):
                         "meta": {
                             "risk_level": "normal",
                             "category": "browser",
-                            "message": f"{len(new_urls)} URL(s) from browser history",
+                            "message": f"{len(new_urls)} URL(s) visited during session",
                         },
                     })
                 else:
-                    log.debug("No browser history URLs found")
+                    log.debug("No browser history URLs found since agent started")
             except Exception as e:
                 log.error(f"Browser history scan error: {e}", exc_info=True)
             
