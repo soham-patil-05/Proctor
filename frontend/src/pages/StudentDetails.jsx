@@ -261,8 +261,13 @@ export default function StudentDetails() {
     /* ── Browser history events ─────────────────────────────── */
 
     ws.on('browser_history', (data) => {
+      console.log('🔍 Received browser_history event:', data);
+      console.log('🔍 Is array?', Array.isArray(data));
+      console.log('🔍 Data length:', Array.isArray(data) ? data.length : 'N/A');
+      
       if (Array.isArray(data)) {
         setBrowserHistory((prev) => {
+          console.log('🔍 Previous browser history count:', prev.length);
           const merged = new Map(prev.map((h) => [h.url, h]));
           for (const entry of data) {
             const existing = merged.get(entry.url);
@@ -282,9 +287,11 @@ export default function StudentDetails() {
               });
             }
           }
-          return Array.from(merged.values()).sort(
+          const result = Array.from(merged.values()).sort(
             (a, b) => (b.last_visited || 0) - (a.last_visited || 0)
           );
+          console.log('🔍 Updated browser history count:', result.length);
+          return result;
         });
       }
     });
@@ -450,6 +457,8 @@ export default function StudentDetails() {
   /* ── Section: Network (Browser History) ──────────────────────── */
 
   const renderNetworkSection = () => {
+    console.log('🔍 renderNetworkSection called, browserHistory length:', browserHistory.length);
+    
     const formatUrl = (url) => {
       try {
         const urlObj = new URL(url);
