@@ -34,12 +34,12 @@ async def run(session_id: str, student_id: str, token: str):
         """Monitor browser history for visited URLs."""
         import time
         log.info("Browser history monitor started")
-        last_scan = time.time() - 300  # Start 5 mins ago to get recent history
         
         while True:
             try:
                 new_urls = browser_history.get_new_history()
                 if new_urls:
+                    log.info(f"Sending {len(new_urls)} browser history URLs to server")
                     # Send as browser_history event
                     await send_fn({
                         "type": "browser_history",
@@ -51,8 +51,10 @@ async def run(session_id: str, student_id: str, token: str):
                             "message": f"{len(new_urls)} URL(s) from browser history",
                         },
                     })
+                else:
+                    log.debug("No browser history URLs found")
             except Exception as e:
-                log.debug(f"Browser history scan error: {e}")
+                log.error(f"Browser history scan error: {e}", exc_info=True)
             
             # Scan every 10 seconds
             await asyncio.sleep(10)

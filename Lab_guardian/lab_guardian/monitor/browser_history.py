@@ -203,48 +203,62 @@ def scan_browser_history(since_timestamp: float = None) -> List[Dict]:
     # Chrome-based browsers
     for browser_key in ['chrome', 'chromium', 'brave', 'edge']:
         db_paths = _get_browser_db_path(browser_key)
+        log.info(f"Looking for {BROWSER_PATHS[browser_key]['name']}: found {len(db_paths)} database(s)")
         for db_path in db_paths:
             if os.path.exists(db_path):
-                log.info(f"Scanning {BROWSER_PATHS[browser_key]['name']} history")
+                log.info(f"Scanning {BROWSER_PATHS[browser_key]['name']} history from {db_path}")
                 urls = _read_chrome_history(db_path, since_timestamp)
+                log.info(f"  -> Found {len(urls)} URLs")
                 all_urls.extend(urls)
+            else:
+                log.debug(f"  -> Database not found: {db_path}")
     
     # Firefox
     firefox_paths = _get_browser_db_path('firefox')
+    log.info(f"Looking for Firefox: found {len(firefox_paths)} database(s)")
     for db_path in firefox_paths:
         if os.path.exists(db_path):
-            log.info("Scanning Firefox history")
+            log.info(f"Scanning Firefox history from {db_path}")
             urls = _read_firefox_history(db_path, since_timestamp)
+            log.info(f"  -> Found {len(urls)} URLs")
             all_urls.extend(urls)
+        else:
+            log.debug(f"  -> Database not found: {db_path}")
     
     # Sort by last visited time (most recent first)
     all_urls.sort(key=lambda x: x['last_visited'], reverse=True)
     
-    log.info(f"Found {len(all_urls)} URLs from browser history")
+    log.info(f"Total: Found {len(all_urls)} URLs from browser history")
     return all_urls
 
 
 # Track last scan time
 _last_scan_time = 0
 _last_urls = []
+_first_scan = True
 
 
 def get_new_history() -> List[Dict]:
-    """Get only newly visited URLs since last scan.
+    """Get browser history URLs.
+    
+    On first scan: Returns ALL URLs from history
+    On subsequent scans: Returns ALL URLs (refreshed)
     
     Returns:
-        List of new URL entries
+        List of URL entries
     """
-    global _last_scan_time, _last_urls
+    global _last_scan_time, _last_urls, _first_scan
     
-    # Scan for history
-    current_urls = scan_browser_history(since_timestamp=_last_scan_time)
-    
-    # Update scan time
-    _last_scan_time = time.time()
-    
-    # Return only new URLs
-    new_urls = current_urls
-    
-    _last_urls = current_urls
-    return new_urls
+    try:
+        # Always scan ALL URLs (don't filter by timestamp)
+        current_urls = scan_browser_history(since_timestamp=None)
+        
+        # Update scan time
+        _last_scan_time = time.time()
+        _first_scan = False
+        
+        _last_urls = current_urls
+        return current_urls
+    except Exception as e:
+        log.error(f"Error getting browser history: {e}")
+        return []
