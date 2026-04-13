@@ -93,28 +93,42 @@ def _read_chrome_history(db_path: str, since_timestamp: float = None) -> List[Di
         # Convert to Unix timestamp (seconds since Jan 1, 1970)
         chrome_epoch_offset = 11644473600000000  # microseconds
         
-        query = """
-            SELECT url, title, visit_count, last_visit_time 
-            FROM urls 
-            ORDER BY last_visit_time DESC
-            LIMIT 100
-        """
+        # Filter in query for efficiency
+        if since_timestamp:
+            # Convert our timestamp (seconds) to Chrome format (microseconds since 1601)
+            chrome_timestamp = int((since_timestamp * 1000000) + chrome_epoch_offset)
+            query = """
+                SELECT url, title, visit_count, last_visit_time 
+                FROM urls 
+                WHERE last_visit_time > ?
+                ORDER BY last_visit_time DESC
+                LIMIT 200
+            """
+            cursor.execute(query, (chrome_timestamp,))
+        else:
+            query = """
+                SELECT url, title, visit_count, last_visit_time 
+                FROM urls 
+                ORDER BY last_visit_time DESC
+                LIMIT 200
+            """
+            cursor.execute(query)
         
-        cursor.execute(query)
         rows = cursor.fetchall()
+        log.info(f"Chrome query returned {len(rows)} rows")
         
         for row in rows:
             url, title, visit_count, chrome_time = row
             
             # Convert Chrome time to Unix timestamp
-            if chrome_time:
-                unix_timestamp = (chrome_time - chrome_epoch_offset) / 1000000
+            if chrome_time and chrome_time > 0:
+                unix_timestamp = (chrome_time - chrome_epoch_offset) / 1000000.0
+                
+                # Debug logging for first few entries
+                if len(urls) < 3:
+                    log.debug(f"Chrome URL: {url[:50]}... time={chrome_time} -> {unix_timestamp} -> {time.ctime(unix_timestamp)}")
             else:
                 unix_timestamp = 0
-            
-            # Skip if older than our last check
-            if since_timestamp and unix_timestamp < since_timestamp:
-                continue
             
             urls.append({
                 'url': url,
@@ -125,10 +139,11 @@ def _read_chrome_history(db_path: str, since_timestamp: float = None) -> List[Di
             })
         
         conn.close()
-        os.remove(temp_db)
+        if os.path.exists(temp_db):
+            os.remove(temp_db)
         
     except Exception as e:
-        log.debug(f"Error reading Chrome history from {db_path}: {e}")
+        log.error(f"Error reading Chrome history from {db_path}: {e}", exc_info=True)
     
     return urls
 
@@ -147,30 +162,46 @@ def _read_firefox_history(db_path: str, since_timestamp: float = None) -> List[D
         conn = sqlite3.connect(temp_db)
         cursor = conn.cursor()
         
-        # Firefox stores time in microseconds since Jan 1, 1970
-        query = """
-            SELECT p.url, p.title, p.visit_count, p.last_visit_date
-            FROM moz_places p
-            WHERE p.visit_count > 0
-            ORDER BY p.last_visit_date DESC
-            LIMIT 100
-        """
+        # Firefox stores time in MICROSECONDS since Jan 1, 1970
+        # But we need to filter in the query to be efficient
+        if since_timestamp:
+            # Convert our timestamp (seconds) to Firefox format (microseconds)
+            firefox_timestamp = int(since_timestamp * 1000000)
+            query = """
+                SELECT p.url, p.title, p.visit_count, p.last_visit_date
+                FROM moz_places p
+                WHERE p.visit_count > 0 AND p.last_visit_date > ?
+                ORDER BY p.last_visit_date DESC
+                LIMIT 200
+            """
+            cursor.execute(query, (firefox_timestamp,))
+        else:
+            query = """
+                SELECT p.url, p.title, p.visit_count, p.last_visit_date
+                FROM moz_places p
+                WHERE p.visit_count > 0
+                ORDER BY p.last_visit_date DESC
+                LIMIT 200
+            """
+            cursor.execute(query)
         
-        cursor.execute(query)
         rows = cursor.fetchall()
+        log.info(f"Firefox query returned {len(rows)} rows")
         
         for row in rows:
             url, title, visit_count, moz_time = row
             
-            # Convert Firefox time (microseconds) to seconds
-            if moz_time:
-                unix_timestamp = moz_time / 1000000
+            # Firefox stores time in microseconds since Unix epoch
+            # Convert to seconds for consistency
+            if moz_time and moz_time > 0:
+                # Firefox time is in microseconds
+                unix_timestamp = moz_time / 1000000.0
+                
+                # Debug logging for first few entries
+                if len(urls) < 3:
+                    log.debug(f"Firefox URL: {url[:50]}... time={moz_time} -> {unix_timestamp} -> {time.ctime(unix_timestamp)}")
             else:
                 unix_timestamp = 0
-            
-            # Skip if older than our last check
-            if since_timestamp and unix_timestamp < since_timestamp:
-                continue
             
             urls.append({
                 'url': url,
@@ -181,10 +212,11 @@ def _read_firefox_history(db_path: str, since_timestamp: float = None) -> List[D
             })
         
         conn.close()
-        os.remove(temp_db)
+        if os.path.exists(temp_db):
+            os.remove(temp_db)
         
     except Exception as e:
-        log.debug(f"Error reading Firefox history from {db_path}: {e}")
+        log.error(f"Error reading Firefox history from {db_path}: {e}", exc_info=True)
     
     return urls
 
