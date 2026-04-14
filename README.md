@@ -14,12 +14,11 @@ A comprehensive, full-stack monitoring solution for computer labs that enables t
 - **Smart Resource Thresholds**: Tracks processes with >0.5% CPU or >30MB memory (lowered from 1% CPU / 50MB)
 
 ### Network Monitoring Improvements
-- **Browser History Integration**: Scans browser SQLite databases to retrieve full URLs visited (not just domains)
+- **Browser History Integration**: Scans browser SQLite databases to retrieve full URLs visited during the session
   - Supports: Google Chrome, Chromium, Mozilla Firefox, Microsoft Edge, Brave
   - Displays: Full URL, page title, visit count, last visit time, browser name
-- **Domain Tracking**: Monitors actual websites accessed on web ports (80, 443, 8080, 8443)
-- **Infrastructure Filtering**: Automatically filters out CDN/infrastructure domains (1e100.net, cloudfront.net, akamai.net, etc.)
-- **Reverse DNS with Fallback**: Resolves IPs to domain names, falls back to IP if DNS fails
+  - **Session-Only Tracking**: Only shows URLs visited AFTER the agent starts (not entire browser history)
+  - Safe database reading with file locking protection
 
 ### Terminal Monitoring Refinements
 - **User Commands Only**: Filters out system commands (cron, systemd, etc.)
@@ -27,7 +26,8 @@ A comprehensive, full-stack monitoring solution for computer labs that enables t
 - **Risk Classification**: Tools like curl, wget, git flagged as high-risk; python/node as medium-risk
 
 ### UI/UX Improvements
-- **Network Tab Reorganization**: Shows "Top Domains Accessed" first, then "Browser History" below
+- **Network Tab Simplification**: Shows only "Browser History" with full URLs visited during session
+- **USB Device Brand Names**: Displays actual USB vendor/model names (e.g., "SanDisk Ultra", "Samsung Flash Drive") instead of generic "USB Storage Device"
 - **Connection Status Reliability**: Improved WebSocket heartbeat (30s timeout instead of 10s) reduces false "Connection Lost" indicators
 - **Process Display**: Grouped processes show all PIDs, total CPU%, and total memory usage
 
@@ -176,11 +176,10 @@ A modern React SPA that provides teachers with:
     - Processes grouped by name with instance counts
     - Incognito/private browsing detection
     - Human-readable process labels
-  - Connected USB device tracking
+  - Connected USB device tracking with vendor/model names (e.g., "SanDisk Ultra")
   - Network activity monitoring:
-    - **Top Domains Accessed**: Summary of website domains with request counts
-    - **Browser History**: Full URLs visited (from Chrome, Firefox, Edge, Brave databases)
-    - Domain risk classification (AI cheating tools flagged as high risk)
+    - **Browser History**: Full URLs visited during session (from Chrome, Firefox, Edge, Brave databases)
+    - Session-only tracking: Only shows URLs visited AFTER agent starts
   - Terminal command logging
     - User commands only (system commands filtered)
     - Risk-level classification for tools (curl, wget, git = high risk)
@@ -193,7 +192,8 @@ A modern React SPA that provides teachers with:
 - Automatic WebSocket reconnection with exponential backoff
 - 2-second TTL cache on snapshot endpoints to reduce DB load
 - **Process Grouping**: Same-name processes grouped with aggregated stats
-- **Browser History Display**: Full URLs with titles, visit counts, and timestamps
+- **Browser History Display**: Full URLs with titles, visit counts, timestamps, and browser names
+- **USB Device Names**: Shows actual brand names extracted from sysfs (SanDisk, Kingston, Samsung, etc.)
 - **Connection Status**: Reliable WebSocket status indicator with improved heartbeat (30s timeout)
 
 ### 2. Backend API Server
@@ -225,8 +225,9 @@ Standalone WebSocket server (Port 8001) managing:
 - **Heartbeat Monitoring**: 15-second timeout for agent liveness
 - **Event Forwarding**: Real-time broadcast from agents to teachers
 - **Redis Buffering**: Last 100 events per student for late-joining teachers
-- **Browser History Support**: Handles `browser_history` events and forwards to teachers
+- **Browser History Support**: Handles `browser_history` events (session-only) and forwards to teachers
 - **Terminal Event Storage**: Stores terminal commands with risk classification
+- **USB Device Support**: Handles device events with vendor/model information
 
 **Connection Endpoints**:
 - Agent: `ws://host:8001/ws/agents/sessions/<sessionId>/students/<studentId>`
@@ -240,10 +241,10 @@ Python agent that runs on student lab machines:
 
 **Enhanced Capabilities**:
 - **Process Monitoring**: Detects incognito browsing, classifies processes by risk, filters system processes
-- **Network Monitoring**: Tracks actual websites visited (not just IPs), filters infrastructure/CDN domains
-- **Browser History Scanning**: Reads browser databases for complete URL history
+- **Network Monitoring**: Browser history scanning for full URL tracking during sessions
+- **Browser History Scanning**: Reads browser databases for complete URL history (session-only)
 - **Terminal Monitoring**: Captures user commands only, excludes system processes and browser activity
-- **USB Detection**: Only tracks external USB storage devices
+- **USB Detection**: Only tracks external USB storage devices with vendor/model names
 
 **Workflow**:
 1. **HTTP Join**: `POST /api/students/join-session` with roll number and session ID
@@ -259,11 +260,11 @@ Python agent that runs on student lab machines:
 | Monitor | What It Reports | Snapshot Interval | Delta Interval |
 |---------|----------------|-------------------|----------------|
 | Process | PIDs, names, CPU %, memory, status (grouped by name in UI) | 30s | 3s |
-| Device | USB storage devices only | 30s | 2s (poll) |
+| Device | USB storage devices with vendor/model names | 30s | 2s (poll) |
 | Network | Interfaces, IPs, gateway, DNS, TCP connections | 30s | 5s |
 | Network (ss) | Terminal tool connections (curl, wget, git…) | — | 2s |
 | Network (auditd) | Full terminal commands with args | — | 2s (tail) |
-| Browser History | Full URLs from browser databases (Chrome, Firefox, Edge, Brave) | — | 10s |
+| Browser History | Full URLs from browser databases (session-only) | — | 10s |
 
 **Process Monitoring Features**:
 - **System Process Filtering**: Only shows user-started processes, filters out root/system processes
@@ -276,9 +277,9 @@ Python agent that runs on student lab machines:
 - **Process Grouping**: Frontend groups processes with same name, shows instance count and aggregated stats
 
 **Network Monitoring Features**:
-- **Domain Tracking**: Monitors connections on web ports (80, 443, 8080, 8443)
-- **Infrastructure Filtering**: Filters out CDN/infrastructure domains (1e100.net, cloudfront.net, etc.)
-- **Reverse DNS**: Resolves IPs to domain names with fallback to IP if DNS fails
+- **Browser History Only**: Focuses on scanning browser databases for complete URL tracking
+- **Session-Only Tracking**: Only reports URLs visited AFTER the agent starts
+- **Timestamp Filtering**: Efficiently filters URLs in SQL queries (not after fetching)
 - **Terminal Command Filtering**: Only shows user commands, filters out system commands (cron, systemd)
 - **Browser Activity Exclusion**: Terminal section excludes browser network activity
 
@@ -287,7 +288,14 @@ Python agent that runs on student lab machines:
 - **Supported Browsers**: Google Chrome, Chromium, Mozilla Firefox, Microsoft Edge, Brave
 - **Data Extracted**: URL, page title, visit count, last visit timestamp, browser name
 - **Safe Reading**: Copies database to /tmp to avoid file locking issues
-- **Update Frequency**: Scans every 10 seconds for new URLs
+- **Update Frequency**: Scans every 10 seconds for URLs visited during session
+- **Session Start Time**: Records agent start time and filters all URLs before that timestamp
+
+**USB Device Detection**:
+- **Vendor/Model Extraction**: Reads from sysfs (`/sys/block/{device}/device/vendor` and `model`)
+- **Brand Name Mapping**: Converts vendor hex IDs to readable names (50+ vendors mapped)
+- **Examples**: "SanDisk Ultra", "Samsung Flash Drive", "Kingston DataTraveler"
+- **Fallback**: Shows "USB Storage Device" if vendor/model not available
 
 **Message Types** (Agent → Server):
 - `process_snapshot`: Full process list
@@ -298,10 +306,9 @@ Python agent that runs on student lab machines:
 - `device_connected`: Device plugged in
 - `device_disconnected`: Device removed
 - `network_snapshot`: Network info update
-- `domain_activity`: Domain connection counts
 - `terminal_request`: Terminal tool network activity
 - `terminal_command`: Terminal command from auditd
-- `browser_history`: Full URLs from browser history
+- `browser_history`: Full URLs from browser history (session-only)
 - `heartbeat`: Keep-alive ping
 
 ---
@@ -404,10 +411,10 @@ PostgreSQL 15 with UUIDs and automatic timestamps. All tables use `IF NOT EXISTS
 - Unique constraint: `(session_id, student_id, pid)`
 - **Enhanced**: Includes process labels (human-readable names), incognito detection flag, and category classification
 
-**domain_activity**: Aggregated domain request counts per student/session
+**domain_activity**: Aggregated domain request counts per student/session (DEPRECATED)
 - `id` (UUID), `session_id` (FK), `student_id` (FK), `domain`, `request_count`, `risk_level`, `last_accessed`
 - Unique constraint: `(session_id, student_id, domain)`
-- **Note**: Only tracks external web ports (80, 443, 8080, 8443), filters infrastructure/CDN domains
+- **Note**: This table is no longer populated. Domain tracking was replaced by browser history scanning.
 
 **terminal_events**: Commands executed in terminal by students
 - `id` (UUID), `session_id` (FK), `student_id` (FK), `tool`, `remote_ip`, `remote_host`, `remote_port`, `pid`, `event_type`, `risk_level`, `message`, `detected_at`
@@ -425,7 +432,7 @@ PostgreSQL 15 with UUIDs and automatic timestamps. All tables use `IF NOT EXISTS
 | `idx_sessions_is_live` | sessions | is_live | Filter live sessions quickly |
 | `idx_session_students_status` | session_students | session_id, current_status | Per-session status queries |
 | `idx_live_processes_student` | live_processes | student_id, session_id | Per-student process queries |
-| `idx_domain_activity_student` | domain_activity | student_id, session_id | Domain activity queries |
+| `idx_domain_activity_student` | domain_activity | student_id, session_id | Domain activity queries (DEPRECATED) |
 | `idx_terminal_events_student` | terminal_events | student_id, session_id | Terminal command queries |
 
 ---
@@ -812,8 +819,9 @@ LabGuardian/
 │   │   ├── dispatcher.py         # Orchestrates monitors → ws_client
 │   │   └── monitor/
 │   │       ├── process_monitor.py    # psutil-based process tracking
-│   │       ├── device_monitor.py     # USB/block device monitoring
-│   │       └── network_monitor.py    # ss + auditd + domain aggregation
+│   │       ├── device_monitor.py     # USB/block device monitoring with vendor/model
+│   │       ├── network_monitor.py    # ss + auditd terminal monitoring
+│   │       └── browser_history.py    # Browser SQLite database scanning
 │   ├── systemd/                  # systemd service file
 │   ├── debian/                   # Debian package configuration
 │   ├── setup.py                  # Python package setup
