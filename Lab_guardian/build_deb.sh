@@ -21,9 +21,15 @@ mkdir -p "$PACKAGE_DIR/usr/bin"
 mkdir -p "$PACKAGE_DIR/usr/share/applications"
 mkdir -p "$PACKAGE_DIR/etc/lab-guardian"
 
-# Copy agent files
+# Copy agent files (FIXED: properly copy entire module structure)
 echo "📦 Copying agent files..."
-cp -r lab_guardian/* "$PACKAGE_DIR/opt/lab-guardian/"
+# Copy the entire lab_guardian directory
+mkdir -p "$PACKAGE_DIR/opt/lab-guardian/lab_guardian"
+cp -r lab_guardian/* "$PACKAGE_DIR/opt/lab-guardian/lab_guardian/"
+# Also copy the __init__.py and setup files to root
+cp lab_guardian/__init__.py "$PACKAGE_DIR/opt/lab-guardian/" 2>/dev/null || true
+cp requirements.txt "$PACKAGE_DIR/opt/lab-guardian/"
+cp setup.py "$PACKAGE_DIR/opt/lab-guardian/" 2>/dev/null || true
 
 # Create Python virtual environment with all dependencies
 echo "🐍 Setting up Python environment..."
@@ -33,14 +39,21 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 pip install PyQt5
-cd ../../../..
+# Install the lab_guardian module properly
+pip install -e . 2>/dev/null || pip install . 2>/dev/null || true
+cd ../../../../..
 
-# Create launcher script
+# Create launcher script (FIXED: ensure module can be found)
 cat > "$PACKAGE_DIR/opt/lab-guardian/start-agent.sh" << 'EOF'
 #!/bin/bash
 # Start Lab Guardian Agent with virtual environment
 cd /opt/lab-guardian
 source venv/bin/activate
+
+# Ensure the module is in Python path
+export PYTHONPATH="/opt/lab-guardian:$PYTHONPATH"
+
+# Run the agent
 python3 -m lab_guardian start "$@"
 EOF
 chmod +x "$PACKAGE_DIR/opt/lab-guardian/start-agent.sh"
@@ -82,13 +95,33 @@ Description: Lab Guardian Exam Monitoring Agent
  terminal commands, and USB devices during exam sessions.
 EOF
 
-# Create postinst script (runs after installation)
+# Create postinst script (runs after installation) - IMPROVED
 cat > "$PACKAGE_DIR/DEBIAN/postinst" << 'EOF'
 #!/bin/bash
 set -e
 
 echo "🛡️ Lab Guardian Agent installed successfully!"
 echo ""
+
+# Fix permissions
+chown -R root:root /opt/lab-guardian
+chmod -R 755 /opt/lab-guardian
+
+# Ensure lab_guardian module is properly set up
+if [ ! -d "/opt/lab-guardian/lab_guardian" ]; then
+    echo "⚠️  Warning: lab_guardian module not found. Please reinstall."
+    exit 1
+fi
+
+# Install the module if not already done
+if [ -f "/opt/lab-guardian/setup.py" ]; then
+    echo "🔧 Setting up agent module..."
+    cd /opt/lab-guardian
+    source venv/bin/activate
+    pip install -e . >/dev/null 2>&1 || pip install . >/dev/null 2>&1 || true
+    deactivate
+fi
+
 echo "To start the agent:"
 echo "  1. Launch from Applications menu: 'Lab Guardian Agent'"
 echo "  2. Or run from terminal: lab-guardian start"
@@ -101,12 +134,9 @@ echo ""
 echo "For verbose logging:"
 echo "  lab-guardian start -vv"
 
-# Set proper permissions
-chown -R root:root /opt/lab-guardian
-chmod -R 755 /opt/lab-guardian
-
 # Create default config
 if [ ! -f /etc/lab-guardian/config ]; then
+    mkdir -p /etc/lab-guardian
     cat > /etc/lab-guardian/config << 'CONF'
 # Lab Guardian Agent Configuration
 BACKEND_URL=http://localhost:8000
