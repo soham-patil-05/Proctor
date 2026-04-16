@@ -1,5 +1,4 @@
 import { BrowserRouter, useRoutes } from 'react-router-dom';
-import { SessionProvider } from './context/SessionContext';
 import { routes } from './routes';
 
 function AppRoutes() {
@@ -9,9 +8,7 @@ function AppRoutes() {
 function App() {
   return (
     <BrowserRouter>
-      <SessionProvider>
-        <AppRoutes />
-      </SessionProvider>
+      <AppRoutes />
     </BrowserRouter>
   );
 }
