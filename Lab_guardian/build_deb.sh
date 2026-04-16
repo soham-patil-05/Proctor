@@ -26,8 +26,9 @@ echo "📦 Copying agent files..."
 # Copy the entire lab_guardian directory
 mkdir -p "$PACKAGE_DIR/opt/lab-guardian/lab_guardian"
 cp -r lab_guardian/* "$PACKAGE_DIR/opt/lab-guardian/lab_guardian/"
-# Also copy the __init__.py and setup files to root
+# Also copy the __init__.py, __main__.py and setup files to root
 cp lab_guardian/__init__.py "$PACKAGE_DIR/opt/lab-guardian/" 2>/dev/null || true
+cp lab_guardian/__main__.py "$PACKAGE_DIR/opt/lab-guardian/" 2>/dev/null || true
 cp requirements.txt "$PACKAGE_DIR/opt/lab-guardian/"
 cp setup.py "$PACKAGE_DIR/opt/lab-guardian/" 2>/dev/null || true
 
