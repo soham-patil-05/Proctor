@@ -175,11 +175,45 @@ def _get_usb_vendor_model(device_path: str) -> tuple[str, str]:
 # Snapshot helpers
 # ---------------------------------------------------------------------------
 
+def _get_base_device(device_path: str) -> str:
+    """Get the base device name from a partition path.
+    
+    Examples:
+        /dev/sda1 -> /dev/sda
+        /dev/sda -> /dev/sda
+        /dev/mmcblk0p1 -> /dev/mmcblk0
+        /dev/nvme0n1p1 -> /dev/nvme0n1
+    """
+    import re
+    dev = device_path
+    
+    # Handle NVMe devices: /dev/nvme0n1p1 -> /dev/nvme0n1
+    if 'nvme' in dev:
+        # Match pattern like nvme0n1p1 -> keep nvme0n1
+        match = re.match(r'(/dev/nvme\d+n\d+)', dev)
+        if match:
+            return match.group(1)
+        return dev
+    
+    # Handle MMC/SD cards: /dev/mmcblk0p1 -> /dev/mmcblk0
+    if 'mmcblk' in dev:
+        match = re.match(r'(/dev/mmcblk\d+)', dev)
+        if match:
+            return match.group(1)
+        return dev
+    
+    # Handle standard SCSI/SATA: /dev/sda1 -> /dev/sda, /dev/sda -> /dev/sda
+    # Remove trailing digits
+    base = re.sub(r'\d+$', '', dev)
+    return base if base else device_path
+
+
 def _collect_devices() -> dict[str, dict]:
-    """Return dict keyed by device path/name, with fields matching backend schema.
+    """Return dict keyed by base device path, with fields matching backend schema.
     
     Only collects USB storage devices (removable drives).
     Filters out internal drives, network drives, and virtual drives.
+    Groups multiple partitions of the same physical device into one entry.
     """
     devices: dict[str, dict] = {}
     for part in psutil.disk_partitions(all=False):
@@ -202,6 +236,13 @@ def _collect_devices() -> dict[str, dict]:
         # Additional check: skip if it looks like an internal drive
         if part.mountpoint in ["/", "/boot", "/home", "/var", "/usr", "/tmp"]:
             continue
+        
+        # Get base device name (group partitions together)
+        base_device = _get_base_device(part.device)
+        
+        # Skip if we already recorded this base device
+        if base_device in devices:
+            continue
             
         usage = None
         try:
@@ -210,8 +251,8 @@ def _collect_devices() -> dict[str, dict]:
             pass
 
         dev_info = {
-            "id": part.device,
-            "name": f"{part.device} ({part.mountpoint})",
+            "id": base_device,
+            "name": f"{base_device} ({part.mountpoint})",
             "type": "usb",
             "metadata": {
                 "mountpoint": part.mountpoint,
@@ -222,7 +263,7 @@ def _collect_devices() -> dict[str, dict]:
         }
         
         # Try to get USB vendor/model information
-        vendor, model = _get_usb_vendor_model(part.device)
+        vendor, model = _get_usb_vendor_model(base_device)
         if vendor:
             dev_info["metadata"]["vendor"] = vendor
         if model:
@@ -230,7 +271,7 @@ def _collect_devices() -> dict[str, dict]:
         
         # Enrich with classification
         _classify_device(dev_info)
-        devices[part.device] = dev_info
+        devices[base_device] = dev_info
     return devices
 
 

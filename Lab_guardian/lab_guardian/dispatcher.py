@@ -135,6 +135,18 @@ async def run_with_ui(local_db, ui_window, backend_url=None):
                 break
             await asyncio.sleep(5)
     
+    async def cleanup_task():
+        """Periodically clean old data to keep DB lean."""
+        while True:
+            await asyncio.sleep(300)  # Every 5 minutes
+            if session_id:
+                try:
+                    result = local_db.cleanup_old_data(session_id, max_age_hours=24)
+                    size = local_db.get_db_size()
+                    log.debug(f"DB cleanup: {result}, size={size/1024:.1f}KB")
+                except Exception as e:
+                    log.error(f"Cleanup error: {e}")
+    
     # Launch all concurrently
     tasks = [
         asyncio.create_task(store_to_local_db(), name="store_local"),
@@ -143,6 +155,7 @@ async def run_with_ui(local_db, ui_window, backend_url=None):
         asyncio.create_task(network_monitor.run(enqueue), name="net"),
         asyncio.create_task(browser_history_monitor_task(enqueue), name="browser"),
         asyncio.create_task(start_sync_when_ready(), name="sync"),
+        asyncio.create_task(cleanup_task(), name="cleanup"),
     ]
     
     try:

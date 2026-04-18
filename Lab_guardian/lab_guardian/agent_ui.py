@@ -280,7 +280,7 @@ class AgentMainWindow(QMainWindow):
         
         # Processes Tab
         self.process_table = self.create_activity_table([
-            "PID", "Process Name", "CPU %", "Memory (MB)", "Risk", "Status"
+            "Count", "Process Name", "CPU %", "Memory (MB)", "Risk", "Status"
         ])
         self.tab_widget.addTab(self.process_table, "📊 Processes")
         
@@ -507,19 +507,75 @@ class AgentMainWindow(QMainWindow):
             self.status_duration.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
     
     def on_processes_update(self, processes):
-        """Update process table with new data."""
+        """Update process table with grouped process data.
+        
+        Groups processes by name, showing aggregated stats:
+        - Count: number of instances
+        - CPU %: sum of all instances
+        - Memory: sum of all instances
+        - Risk: highest risk level among instances
+        """
         self.process_table.setRowCount(0)
         
+        # Group processes by name
+        grouped = {}
         for proc in processes:
+            name = proc.get('process_name', 'Unknown')
+            # Check if any instance is incognito
+            is_incognito = proc.get('is_incognito', False) or proc.get('category') == 'incognito'
+            
+            if name not in grouped:
+                grouped[name] = {
+                    'count': 0,
+                    'cpu_percent': 0.0,
+                    'memory_mb': 0.0,
+                    'risk_level': 'low',
+                    'status': 'running',
+                    'has_incognito': False
+                }
+            
+            g = grouped[name]
+            g['count'] += 1
+            g['cpu_percent'] += proc.get('cpu_percent', 0)
+            g['memory_mb'] += proc.get('memory_mb', 0)
+            
+            # Track if any instance is incognito
+            if is_incognito:
+                g['has_incognito'] = True
+            
+            # Keep highest risk level
+            risk = proc.get('risk_level', 'normal')
+            if risk == 'high' or g['risk_level'] == 'high':
+                g['risk_level'] = 'high'
+            elif risk == 'medium' or g['risk_level'] == 'medium':
+                g['risk_level'] = 'medium'
+            else:
+                g['risk_level'] = risk
+        
+        # Sort by risk level (high first), then by CPU usage
+        risk_order = {'high': 0, 'medium': 1, 'low': 2, 'normal': 3}
+        sorted_processes = sorted(
+            grouped.items(),
+            key=lambda x: (risk_order.get(x[1]['risk_level'], 3), -x[1]['cpu_percent'])
+        )
+        
+        for name, data in sorted_processes:
             row = self.process_table.rowCount()
             self.process_table.insertRow(row)
             
-            self.process_table.setItem(row, 0, QTableWidgetItem(str(proc.get('pid', ''))))
-            self.process_table.setItem(row, 1, QTableWidgetItem(proc.get('process_name', '')))
-            self.process_table.setItem(row, 2, QTableWidgetItem(f"{proc.get('cpu_percent', 0):.1f}%"))
-            self.process_table.setItem(row, 3, QTableWidgetItem(f"{proc.get('memory_mb', 0):.1f}"))
+            # Count with instance indicator
+            count_text = str(data['count']) if data['count'] == 1 else f"{data['count']}"
+            self.process_table.setItem(row, 0, QTableWidgetItem(count_text))
             
-            risk = proc.get('risk_level', 'normal')
+            # Show incognito indicator in process name
+            display_name = name
+            if data.get('has_incognito'):
+                display_name = f"{name} 🔒 (Private/Incognito)"
+            self.process_table.setItem(row, 1, QTableWidgetItem(display_name))
+            self.process_table.setItem(row, 2, QTableWidgetItem(f"{data['cpu_percent']:.1f}%"))
+            self.process_table.setItem(row, 3, QTableWidgetItem(f"{data['memory_mb']:.1f}"))
+            
+            risk = data['risk_level']
             risk_item = QTableWidgetItem(risk.upper())
             if risk == 'high':
                 risk_item.setForeground(QColor("#ef4444"))
@@ -527,7 +583,8 @@ class AgentMainWindow(QMainWindow):
                 risk_item.setForeground(QColor("#f59e0b"))
             self.process_table.setItem(row, 4, risk_item)
             
-            self.process_table.setItem(row, 5, QTableWidgetItem(proc.get('status', '')))
+            status_text = "Running" if data['count'] > 0 else "Stopped"
+            self.process_table.setItem(row, 5, QTableWidgetItem(status_text))
     
     def on_browser_update(self, urls):
         """Update browser history table."""

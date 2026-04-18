@@ -213,27 +213,63 @@ class LocalDatabase:
         self.conn.commit()
     
     def insert_process_snapshot(self, session_id, processes):
-        """Insert a snapshot of multiple processes."""
+        """Replace process snapshot - only keep current state (like UI display).
+        
+        Deletes old processes for this session and inserts fresh snapshot.
+        Groups by process_name to match UI grouping (no duplicate PIDs).
+        """
         timestamp = datetime.now(timezone.utc).timestamp()
         cursor = self.conn.cursor()
         
+        # Clear old processes for this session - we only want current state
+        cursor.execute("DELETE FROM local_processes WHERE session_id = ?", (session_id,))
+        
+        # Group processes by name (like UI does) to avoid duplicates
+        grouped = {}
         for proc in processes:
+            name = proc.get('name', 'Unknown')
+            if name not in grouped:
+                grouped[name] = {
+                    'pid': proc.get('pid'),
+                    'cpu_percent': 0,
+                    'memory_mb': 0,
+                    'risk_level': 'normal',
+                    'category': proc.get('category'),
+                    'label': proc.get('label'),
+                    'is_incognito': proc.get('is_incognito', False),
+                    'count': 0
+                }
+            g = grouped[name]
+            g['count'] += 1
+            g['cpu_percent'] += proc.get('cpu', 0)
+            g['memory_mb'] += proc.get('memory', 0)
+            # Keep highest risk
+            if proc.get('risk_level') == 'high' or g['risk_level'] == 'high':
+                g['risk_level'] = 'high'
+            elif proc.get('risk_level') == 'medium':
+                g['risk_level'] = 'medium'
+            # Track if any instance is incognito
+            if proc.get('is_incognito'):
+                g['is_incognito'] = True
+        
+        # Insert grouped processes (matches UI display)
+        for name, data in grouped.items():
             cursor.execute("""
-                INSERT OR IGNORE INTO local_processes
+                INSERT INTO local_processes
                 (session_id, pid, process_name, cpu_percent, memory_mb, status,
                  risk_level, category, label, is_incognito, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 session_id,
-                proc.get('pid'),
-                proc.get('name'),
-                proc.get('cpu', 0),
-                proc.get('memory', 0),
-                proc.get('status', 'running'),
-                proc.get('risk_level', 'normal'),
-                proc.get('category'),
-                proc.get('label'),
-                1 if proc.get('is_incognito') else 0,
+                data['pid'],
+                f"{name} (x{data['count']})" if data['count'] > 1 else name,
+                data['cpu_percent'],
+                data['memory_mb'],
+                'running',
+                data['risk_level'],
+                data['category'],
+                data['label'],
+                1 if data['is_incognito'] else 0,
                 timestamp
             ))
         
@@ -241,9 +277,20 @@ class LocalDatabase:
     
     # Device methods
     def insert_device(self, session_id, device_data):
-        """Insert a device record."""
+        """Insert or update device - avoid duplicates per session."""
         cursor = self.conn.cursor()
         connected_at = datetime.now(timezone.utc).timestamp()
+        device_id = device_data.get('id')
+        
+        # Check if device already exists for this session
+        cursor.execute("""
+            SELECT id FROM local_devices 
+            WHERE session_id = ? AND device_id = ?
+        """, (session_id, device_id))
+        
+        if cursor.fetchone():
+            # Device already exists, don't duplicate
+            return
         
         cursor.execute("""
             INSERT INTO local_devices
@@ -252,7 +299,7 @@ class LocalDatabase:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             session_id,
-            device_data.get('id'),
+            device_id,
             device_data.get('name'),
             device_data.get('type', 'usb'),
             device_data.get('readable_name'),
@@ -266,9 +313,12 @@ class LocalDatabase:
     
     # Network methods
     def insert_network_info(self, session_id, network_data):
-        """Insert network information."""
+        """Insert or replace network info - only keep current state."""
         timestamp = datetime.now(timezone.utc).timestamp()
         cursor = self.conn.cursor()
+        
+        # Delete old network info for this session
+        cursor.execute("DELETE FROM local_network WHERE session_id = ?", (session_id,))
         
         cursor.execute("""
             INSERT INTO local_network
@@ -287,9 +337,27 @@ class LocalDatabase:
     
     # Terminal methods
     def insert_terminal_event(self, session_id, event_data):
-        """Insert a terminal event."""
+        """Insert a terminal event - deduplicate by command+host combination."""
         detected_at = datetime.now(timezone.utc).timestamp()
         cursor = self.conn.cursor()
+        
+        # Create a unique key for deduplication
+        cmd = event_data.get('full_command', '')[:100]  # Truncate for comparison
+        host = event_data.get('remote_host', event_data.get('remote_ip', ''))
+        tool = event_data.get('tool', 'unknown')
+        dup_key = f"{tool}:{host}:{cmd}"
+        
+        # Check if similar event exists in last 5 minutes (avoid duplicates)
+        five_min_ago = detected_at - 300
+        cursor.execute("""
+            SELECT id FROM local_terminal_events 
+            WHERE session_id = ? AND tool = ? AND remote_host = ? 
+            AND full_command LIKE ? AND detected_at > ?
+        """, (session_id, tool, host, cmd[:50] + '%', five_min_ago))
+        
+        if cursor.fetchone():
+            # Similar recent event exists, skip
+            return
         
         cursor.execute("""
             INSERT INTO local_terminal_events
@@ -298,9 +366,9 @@ class LocalDatabase:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             session_id,
-            event_data.get('tool'),
+            tool,
             event_data.get('remote_ip'),
-            event_data.get('remote_host'),
+            host,
             event_data.get('remote_port'),
             event_data.get('pid'),
             event_data.get('event_type', 'terminal_request'),
@@ -314,27 +382,56 @@ class LocalDatabase:
     
     # Browser history methods
     def insert_browser_history(self, session_id, urls):
-        """Insert or update browser history URLs."""
+        """Insert browser history - only new URLs, update existing ones."""
+        if not urls:
+            return
+            
         cursor = self.conn.cursor()
+        inserted = 0
+        updated = 0
         
         for url_data in urls:
+            url = url_data.get('url')
+            if not url:
+                continue
+                
+            # Check if URL already exists
             cursor.execute("""
-                INSERT INTO local_browser_history
-                (session_id, url, title, visit_count, last_visited, browser)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id, url) DO UPDATE SET
-                    visit_count = MAX(visit_count, excluded.visit_count),
-                    last_visited = MAX(last_visited, excluded.last_visited)
-            """, (
-                session_id,
-                url_data.get('url'),
-                url_data.get('title', ''),
-                url_data.get('visit_count', 1),
-                url_data.get('last_visited', datetime.now(timezone.utc).timestamp()),
-                url_data.get('browser', 'Unknown')
-            ))
+                SELECT id FROM local_browser_history 
+                WHERE session_id = ? AND url = ?
+            """, (session_id, url))
+            
+            if cursor.fetchone():
+                # Update last_visited time only
+                cursor.execute("""
+                    UPDATE local_browser_history 
+                    SET last_visited = ?, visit_count = MAX(visit_count, ?)
+                    WHERE session_id = ? AND url = ?
+                """, (
+                    url_data.get('last_visited', datetime.now(timezone.utc).timestamp()),
+                    url_data.get('visit_count', 1),
+                    session_id,
+                    url
+                ))
+                updated += 1
+            else:
+                # Insert new URL
+                cursor.execute("""
+                    INSERT INTO local_browser_history
+                    (session_id, url, title, visit_count, last_visited, browser)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    session_id,
+                    url,
+                    url_data.get('title', '')[:200],  # Limit title length
+                    url_data.get('visit_count', 1),
+                    url_data.get('last_visited', datetime.now(timezone.utc).timestamp()),
+                    url_data.get('browser', 'Unknown')
+                ))
+                inserted += 1
         
         self.conn.commit()
+        return {'inserted': inserted, 'updated': updated}
     
     # Sync methods
     def get_unsynced_processes(self, session_id):
@@ -435,6 +532,47 @@ class LocalDatabase:
         """, (session_id,))
         
         return [dict(row) for row in cursor.fetchall()]
+    
+    def cleanup_old_data(self, session_id, max_age_hours=24):
+        """Clean up old data to keep database lean.
+        
+        Only keeps recent data (last 24 hours by default).
+        Processes and network are already current-state only.
+        """
+        cursor = self.conn.cursor()
+        cutoff = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
+        
+        # Clean old terminal events (keep last 24h)
+        cursor.execute("""
+            DELETE FROM local_terminal_events 
+            WHERE session_id = ? AND detected_at < ?
+        """, (session_id, cutoff))
+        terminal_deleted = cursor.rowcount
+        
+        # Clean old browser history (keep last 24h)
+        cursor.execute("""
+            DELETE FROM local_browser_history 
+            WHERE session_id = ? AND last_visited < ?
+        """, (session_id, cutoff))
+        browser_deleted = cursor.rowcount
+        
+        # Vacuum to reclaim space
+        cursor.execute("VACUUM")
+        
+        self.conn.commit()
+        
+        if terminal_deleted > 0 or browser_deleted > 0:
+            log.info(f"Cleaned up {terminal_deleted} old terminal events, {browser_deleted} old browser URLs")
+        
+        return {'terminal_deleted': terminal_deleted, 'browser_deleted': browser_deleted}
+    
+    def get_db_size(self):
+        """Get current database file size in bytes."""
+        import os
+        try:
+            return os.path.getsize(self.db_path)
+        except:
+            return 0
     
     def close(self):
         """Close database connection."""

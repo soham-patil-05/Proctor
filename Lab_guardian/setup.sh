@@ -151,7 +151,7 @@ echo -e "${GREEN}  Lab Guardian setup complete!${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
 echo ""
 echo "  Usage:"
-echo "    lab_guardian join --roll-no CS2021001 --session-id <UUID>"
+echo "    lab_guardian start"
 echo ""
 if [ "$SKIP_AUDITD" = false ] && [ "$(id -u)" -eq 0 ]; then
     echo "  auditd rules are active — full terminal command capture enabled."

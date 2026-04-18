@@ -2,9 +2,8 @@
 
 import os
 
-# Backend server URLs
+# Backend server URL for sync
 API_BASE_URL = os.environ.get("LAB_GUARDIAN_API_URL", "http://localhost:8000")
-WS_BASE_URL = os.environ.get("LAB_GUARDIAN_WS_URL", "ws://localhost:8001")
 
 # Monitor intervals (seconds)
 SNAPSHOT_INTERVAL = int(os.environ.get("LG_SNAPSHOT_INTERVAL", "30"))
@@ -15,7 +14,7 @@ NETWORK_SS_INTERVAL = int(os.environ.get("LG_NETWORK_SS_INTERVAL", "2"))
 AUDITD_LOG_PATH = os.environ.get("LG_AUDITD_LOG_PATH", "/var/log/audit/audit.log")
 HEARTBEAT_INTERVAL = int(os.environ.get("LG_HEARTBEAT_INTERVAL", "5"))
 
-# Reconnect backoff
+# Sync retry backoff
 RECONNECT_BASE = 1
 RECONNECT_MAX = 60
 

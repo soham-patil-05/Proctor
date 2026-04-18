@@ -33,30 +33,47 @@ _prev_snapshot: dict[int, dict] = {}
 SAFE_PROCESSES = {
     # System processes (Linux)
     "systemd", "systemd-journal", "systemd-udevd", "systemd-logind", "systemd-resolved",
-    "systemd-timesyn", "dbus-daemon", "accounts-daemon", "udisksd", "polkitd",
-    "networkmanager", "wpa_supplicant", "bluetoothd", "cron", "atd", "sshd",
-    "rsyslogd", "cupsd", "avahi-daemon", "thermald", "irqbalance", 
+    "systemd-timesyn", "systemd-timesyncd", "dbus-daemon", "accounts-daemon", "udisksd", "polkitd",
+    "networkmanager", "wpa_supplicant", "bluetoothd", "cron", "crond", "atd", "sshd",
+    "rsyslogd", "cupsd", "cups-browsed", "avahi-daemon", "thermald", "irqbalance",
     "modemmanager", "switcheroo-control", "gdm3", "lightdm", "sddm",
+    "snapd", "snapd.service", "snapd.socket", "snapd.autoimport", "snapd.seeded",
+    "snapd.core-fixup", "snapd.snap-repair", "snapd.refresh.timer",
+    "pipewire", "pipewire-pulse", "wireplumber", "pulseaudio",
+    "gnome-keyring-daemon", "gnome-keyring-ssh", "gnome-shell", "gnome-session-binary",
+    "xwayland", "Xwayland", "Xorg", "X", "mutter", "kwin_x11", "kwin_wayland",
+    "upowerd", "power-profiles-daemon", "packagekitd", "fwupd", "colord",
+    "kernel", "kworker", "ksoftirqd", "migration", "rcu_sched", "rcu_bh",
+    "jbd2", "ext4-rsv-conver", "loop", "loop0", "loop1", "loop2", "loop3",
+    "snapfuse", "fuse", "gvfsd", "gvfsd-fuse", "gvfs-udisks2-volume-monitor",
+    "vmware-vmblock-fuse", "vmware-user-suid-wrapper", "vmtoolsd",
+    "update-notifier", "fwupd", "whoopsie", "apport", "apport-gtk",
+    "agent​_loguploader", "agent​_xray", "amazon-ssm-agent", "snap.amazon-ssm-agent",
+    "fwupd-refresh", "motd-news", "systemd-resolve", "systemd-networkd",
+    "python3", "python",  # System python processes (usually background services)
+    "agetty", "login", "bash", "zsh", "sh", "dash",  # Shells as system processes when run by system
     
     # System processes (Windows)
-    "svchost", "csrss", "dwm", "winlogon", "lsass", "services", "smss", 
-    "wininit", "taskhost", "taskhostw", "spoolsv", "searchindexer", 
-    "searchprotocolhost", "searchfilterhost", "runtimebroker", 
+    "svchost", "csrss", "dwm", "winlogon", "lsass", "services", "smss",
+    "wininit", "taskhost", "taskhostw", "spoolsv", "searchindexer",
+    "searchprotocolhost", "searchfilterhost", "runtimebroker",
     "shellexperiencehost", "sihost", "ctfmon", "fontdrvhost", "dllhost",
     "lsaiso", "wmiprvse", "conhost", "compattelrunner", "moone",
-    
+
     # File managers/DE (safe but we want to track browsers separately)
     "explorer", "nautilus", "dolphin", "thunar", "xfce4-panel", "gnome-shell",
 }
 
 SUSPICIOUS_PROCESSES = {
     # Web Browsers (important to track)
-    "chrome", "google-chrome", "chromium", "chromium-browser",
-    "firefox", "firefox-esr", 
-    "msedge", "microsoft-edge",
+    "chrome", "google-chrome", "google-chrome-stable", "google-chrome-beta",
+    "chromium", "chromium-browser",
+    "firefox", "firefox-esr", "firefox-bin", "firefox-esr-bin",
+    "firefox.real",  # Snap package wrapper
+    "msedge", "microsoft-edge", "microsoft-edge-beta", "microsoft-edge-dev",
     "brave", "brave-browser",
-    "opera", "opera-browser",
-    "vivaldi", "vivaldi-stable",
+    "opera", "opera-browser", "opera-beta", "opera-developer",
+    "vivaldi", "vivaldi-stable", "vivaldi-snapshot",
     "safari", "epiphany", "midori",
     
     # Communication apps (can be used for cheating)
@@ -150,32 +167,120 @@ UNKNOWN_CPU_THRESHOLD = 5.0
 
 # Incognito/Private browsing indicators in command line
 INCOGNITO_FLAGS = {
-    "--incognito", "-incognito",  # Chrome
-    "--private", "-private", "-private-window",  # Firefox
-    "--inprivate", "-inprivate",  # Edge
-    "--private-browsing",  # Safari
+    # Chrome/Chromium
+    "--incognito", "-incognito",
+    # Firefox (various patterns including snap/firefox builds)
+    "--private", "-private", "-private-window", "--private-window",
+    "-foreground",  # Firefox private windows often have this pattern
+    # Edge
+    "--inprivate", "-inprivate",
+    # Safari
+    "--private-browsing",
+}
+
+# Firefox-specific private mode indicators (command line patterns)
+FIREFOX_PRIVATE_PATTERNS = [
+    "-private-window",  # Standard private window flag
+    "--private-window",
+    "-private",  # Short form
+    "--private",
+]
+
+# Browser executable names that support private browsing
+PRIVATE_CAPABLE_BROWSERS = {
+    # Chrome/Chromium variants
+    "chrome", "google-chrome", "google-chrome-stable", "google-chrome-beta", "google-chrome-unstable",
+    "chromium", "chromium-browser", "chromium-codecs-ffmpeg-extra",
+    # Firefox variants
+    "firefox", "firefox-bin", "firefox-esr", "firefox-esr-bin",
+    "firefox.real",  # Snap package wrapper
+    "snap.firefox",  # Snap package
+    # Edge variants
+    "msedge", "microsoft-edge", "microsoft-edge-beta", "microsoft-edge-dev",
+    # Brave
+    "brave", "brave-browser",
+    # Opera
+    "opera", "opera-beta", "opera-developer",
+    # Vivaldi
+    "vivaldi", "vivaldi-stable", "vivaldi-snapshot",
 }
 
 
 def _check_incognito(proc) -> bool:
-    """Check if a browser process is running in incognito/private mode."""
+    """Check if a browser process is running in incognito/private mode.
+    
+    Supports Chrome, Firefox, Edge, Safari, Brave, Opera, Vivaldi.
+    Works with snap packages and various browser builds.
+    """
     try:
         cmdline = proc.cmdline()
         if not cmdline:
             return False
         
-        # Check if any command line argument matches incognito flags
+        # Get process name - try multiple methods
+        proc_name = ""
+        try:
+            proc_name = proc.name().lower()
+        except:
+            pass
+        
+        # Fallback: get name from cmdline[0]
+        if not proc_name and cmdline:
+            proc_name = cmdline[0].split('/')[-1].lower()
+        
+        # Check if it's a known private-capable browser
+        is_browser = any(browser in proc_name for browser in PRIVATE_CAPABLE_BROWSERS)
+        
+        # Join command line for pattern matching
         cmdline_str = " ".join(cmdline).lower()
+        full_cmdline = " ".join(cmdline)  # Original case for display
+        
+        # Debug logging for all browser-like processes
+        if 'firefox' in proc_name or 'chrome' in proc_name or 'chromium' in proc_name:
+            log.info(f"🔍 BROWSER CHECK: name='{proc_name}', is_browser={is_browser}, cmd={full_cmdline[:120]}")
+        
+        # Check for incognito/private flags
         for flag in INCOGNITO_FLAGS:
-            if flag in cmdline_str:
+            if flag.lower() in cmdline_str:
+                log.info(f"🔒 INCOGNITO DETECTED: {proc_name} with flag {flag}")
                 return True
+        
+        # Firefox-specific: Check for private window patterns
+        if 'firefox' in proc_name or 'firefox-bin' in proc_name or 'firefox.real' in proc_name:
+            # Check for any private-related pattern
+            if any(pattern.lower() in cmdline_str for pattern in FIREFOX_PRIVATE_PATTERNS):
+                log.info(f"🔒 FIREFOX PRIVATE WINDOW DETECTED: {proc_name}")
+                return True
+            # Firefox private windows have specific profile/URL patterns
+            if '-no-remote' in full_cmdline and '-profile' not in full_cmdline:
+                log.info(f"🔒 FIREFOX PRIVATE MODE (no-profile) DETECTED: {proc_name}")
+                return True
+            # Check for new-instance without profile (another private mode indicator)
+            if '-new-instance' in full_cmdline:
+                log.info(f"🔒 FIREFOX NEW-INSTANCE DETECTED: {proc_name}")
+                return True
+        
+        # Chrome/Chromium-specific: Check for guest mode (similar to incognito)
+        if any(name in proc_name for name in ['chrome', 'chromium']):
+            if '--guest' in full_cmdline or '-guest' in full_cmdline:
+                log.info(f"🔒 CHROME GUEST MODE DETECTED: {proc_name}")
+                return True
+            # Check for temp profile (indicates incognito)
+            if '--user-data-dir=' in full_cmdline and 'temp' in full_cmdline.lower():
+                log.info(f"🔒 CHROME TEMP PROFILE DETECTED: {proc_name}")
+                return True
+        
         return False
-    except (psutil.AccessDenied, psutil.NoSuchProcess):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    except Exception as e:
+        log.debug(f"Error checking incognito for {proc.pid}: {e}")
         return False
 
 
 def _classify_process(proc_info: dict, proc_obj=None) -> dict | None:
     """Classify a process and enrich with risk_level, category, label.
+    
 
     Returns None if the process should be filtered out (safe / low priority).
     Returns the enriched dict otherwise.
@@ -262,14 +367,29 @@ def _take_snapshot() -> dict[int, dict]:
                 continue
             
             username = info["username"] or ""
+            username_lower = username.lower()
             
-            # Filter out system processes
-            # Linux: skip root processes (except current user)
+            # Filter out system processes by username
+            # Linux: skip root and other system users
             # Windows: skip SYSTEM, NETWORK SERVICE, LOCAL SERVICE
-            if username.lower() in ["root", "system", "network service", "local service"]:
-                # Allow if it's actually the current user running as root
-                if current_user and current_user.lower() != "root":
-                    continue
+            system_users = {
+                "root", "system", "network service", "local service",
+                "daemon", "bin", "sys", "sync", "games", "man",
+                "lp", "mail", "news", "uucp", "proxy", "www-data",
+                "backup", "list", "irc", "gnats", "nobody",
+                "systemd-network", "systemd-resolve", "messagebus",
+                "_apt", "tss", "kernoops", "whoopsie", "dnsmasq",
+                "avahi", "cups-pk-helper", "fwupd", "saned",
+                "colord", "speech-dispatcher", "pulse", "rtkit",
+                "geoclue", "nm-openvpn", "nm-openconnect",
+            }
+            
+            if username_lower in system_users:
+                # Only allow root processes if current user is root
+                if username_lower == "root" and current_user and current_user.lower() == "root":
+                    pass  # Allow root processes for root user
+                else:
+                    continue  # Skip all other system user processes
             
             # Skip processes with very low resource usage (likely background)
             cpu = round(info["cpu_percent"] or 0.0, 2)

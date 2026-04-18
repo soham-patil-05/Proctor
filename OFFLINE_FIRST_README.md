@@ -370,34 +370,7 @@ tail -f backend/logs/*.log
 
 ---
 
-## 📝 Migration from Old System
-
-If you're upgrading from the old WebSocket-based system:
-
-1. **Backend**: Run new migration
-```bash
-cd backend
-npm run migrate  # Runs 004_add_offline_exam_tables.sql
-```
-
-2. **Frontend**: Update routes
-- Old routes still work for backward compatibility
-- New dashboard at `/`
-
-3. **Agent**: Uninstall old, install new
-```bash
-# Remove old agent
-sudo systemctl stop lab_guardian
-sudo systemctl disable lab_guardian
-sudo pip uninstall lab-guardian
-
-# Install new agent
-sudo dpkg -i lab-guardian-agent-2.0.0.deb
-```
-
----
-
-## 📄 License
+##  License
 
 MIT License - See individual component READMEs for details.
 

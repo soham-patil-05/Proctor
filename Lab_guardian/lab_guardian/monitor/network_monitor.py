@@ -45,6 +45,23 @@ MONITORED_TOOLS: Set[str] = {
     "apt", "apt-get", "ssh", "nc", "ncat", "socat", "node", "npm",
 }
 
+# Browser processes - excluded from terminal tracking (tracked separately via browser_history.py)
+_BROWSER_PROCESSES: Set[str] = {
+    "chrome", "google-chrome", "chromium", "chromium-browser",
+    "firefox", "firefox-esr", "msedge", "microsoft-edge",
+    "brave", "brave-browser", "opera", "vivaldi",
+    "safari", "epiphany", "midori",
+}
+
+# System processes to exclude from terminal tracking
+_SYSTEM_PROCESSES: Set[str] = {
+    "cron", "crond", "systemd", "systemd-journal", "systemd-udevd",
+    "systemd-logind", "systemd-resolved", "systemd-timesyncd",
+    "dbus-daemon", "accounts-daemon", "udisksd", "polkitd",
+    "networkmanager", "wpa_supplicant", "bluetoothd",
+    "rsyslogd", "cupsd", "avahi-daemon",
+}
+
 SUSPICIOUS_TERMINAL_DOMAINS: Set[str] = {
     "chatgpt.com", "openai.com", "gemini.google.com", "bard.google.com",
     "github.com", "gitlab.com", "pastebin.com", "hastebin.com",
@@ -127,6 +144,71 @@ _SKIP_PRIVATE: Set[str] = {"127.0.0.1", "0.0.0.0", "::1", "::"}
 _IP_CACHE: dict = {}
 
 
+def _resolve_ip(ip: str) -> str:
+    """Resolve IP address to hostname (with caching).
+    
+    Returns the IP itself if resolution fails or for private IPs.
+    """
+    # Skip private IPs
+    if ip in _SKIP_PRIVATE or ip.startswith("127.") or ip.startswith("10.") or ip.startswith("192.168."):
+        return ip
+    
+    # Check cache
+    if ip in _IP_CACHE:
+        return _IP_CACHE[ip]
+    
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        _IP_CACHE[ip] = hostname
+        return hostname
+    except (socket.herror, socket.gaierror):
+        _IP_CACHE[ip] = ip
+        return ip
+
+
+def _domain_matches_suspicious(host: str) -> bool:
+    """Check if a hostname/domain matches suspicious patterns.
+    
+    Returns True if the domain is in the suspicious list or matches
+    known cheating/resource patterns.
+    """
+    if not host:
+        return False
+    
+    host_lower = host.lower()
+    
+    # Check exact matches
+    for domain in SUSPICIOUS_TERMINAL_DOMAINS:
+        if domain in host_lower:
+            return True
+    
+    return False
+
+
+def _extract_root_domain(hostname: str) -> str:
+    """Extract the root domain from a hostname.
+    
+    Examples:
+        www.google.com -> google.com
+        api.github.com -> github.com
+        localhost -> localhost
+    """
+    if not hostname or hostname in ("localhost", "127.0.0.1"):
+        return hostname
+    
+    parts = hostname.split(".")
+    if len(parts) <= 2:
+        return hostname
+    
+    # For common TLDs like .com, .org, take last 2 parts
+    # For ccTLDs like .co.uk, take last 3 parts (simplified)
+    tld = parts[-1].lower()
+    if tld in ("uk", "au", "jp", "nz") and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    
+    return ".".join(parts[-2:])
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Layer 1 — ss-based terminal tool detection
 # ═══════════════════════════════════════════════════════════════════════════
@@ -201,6 +283,14 @@ def _parse_ss_output(raw: str) -> List[SSConnection]:
 
         tool_name = match.group(1)
         pid = int(match.group(2))
+
+        # Skip browser processes - these are tracked separately via browser_history.py
+        if tool_name in _BROWSER_PROCESSES:
+            continue
+
+        # Skip system processes
+        if tool_name in _SYSTEM_PROCESSES:
+            continue
 
         # Determine risk level
         if tool_name in MONITORED_TOOLS:
@@ -359,6 +449,14 @@ def _tail_audit_log() -> List[AuditCommand]:
             continue
         tool_path = cmd_parts[0]
         tool_name = os.path.basename(tool_path)
+
+        # Skip browser processes - tracked separately via browser_history.py
+        if tool_name in _BROWSER_PROCESSES:
+            continue
+
+        # Skip system processes
+        if tool_name in _SYSTEM_PROCESSES:
+            continue
 
         if tool_name not in _AUDITD_TOOLS:
             continue
