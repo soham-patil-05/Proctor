@@ -213,26 +213,21 @@ class LocalDatabase:
         self.conn.commit()
     
     def insert_process_snapshot(self, session_id, processes):
-        """Replace process snapshot - only keep current state (like UI display).
+        """Append-only process logging - don't delete old data.
         
-        Deletes old processes for this session and inserts fresh snapshot.
-        Groups by process_name to match UI grouping (no duplicate PIDs).
+        Only inserts new processes that haven't been seen before.
+        No resource consumption stats (CPU/memory) - just process names and risk.
         """
         timestamp = datetime.now(timezone.utc).timestamp()
         cursor = self.conn.cursor()
         
-        # Clear old processes for this session - we only want current state
-        cursor.execute("DELETE FROM local_processes WHERE session_id = ?", (session_id,))
-        
-        # Group processes by name (like UI does) to avoid duplicates
+        # Group processes by name to handle duplicates in single snapshot
         grouped = {}
         for proc in processes:
             name = proc.get('name', 'Unknown')
             if name not in grouped:
                 grouped[name] = {
                     'pid': proc.get('pid'),
-                    'cpu_percent': 0,
-                    'memory_mb': 0,
                     'risk_level': 'normal',
                     'category': proc.get('category'),
                     'label': proc.get('label'),
@@ -241,8 +236,6 @@ class LocalDatabase:
                 }
             g = grouped[name]
             g['count'] += 1
-            g['cpu_percent'] += proc.get('cpu', 0)
-            g['memory_mb'] += proc.get('memory', 0)
             # Keep highest risk
             if proc.get('risk_level') == 'high' or g['risk_level'] == 'high':
                 g['risk_level'] = 'high'
@@ -252,19 +245,28 @@ class LocalDatabase:
             if proc.get('is_incognito'):
                 g['is_incognito'] = True
         
-        # Insert grouped processes (matches UI display)
+        # Insert only new processes (append-only)
         for name, data in grouped.items():
+            process_name = f"{name} (x{data['count']})" if data['count'] > 1 else name
+            
+            # Check if this process name already exists for this session
+            cursor.execute("""
+                SELECT id FROM local_processes 
+                WHERE session_id = ? AND process_name = ?
+            """, (session_id, process_name))
+            
+            if cursor.fetchone():
+                continue  # Skip if already logged
+            
             cursor.execute("""
                 INSERT INTO local_processes
                 (session_id, pid, process_name, cpu_percent, memory_mb, status,
                  risk_level, category, label, is_incognito, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)
             """, (
                 session_id,
                 data['pid'],
-                f"{name} (x{data['count']})" if data['count'] > 1 else name,
-                data['cpu_percent'],
-                data['memory_mb'],
+                process_name,
                 'running',
                 data['risk_level'],
                 data['category'],
@@ -313,12 +315,21 @@ class LocalDatabase:
     
     # Network methods
     def insert_network_info(self, session_id, network_data):
-        """Insert or replace network info - only keep current state."""
+        """Append network info - keep history of network changes."""
         timestamp = datetime.now(timezone.utc).timestamp()
         cursor = self.conn.cursor()
         
-        # Delete old network info for this session
-        cursor.execute("DELETE FROM local_network WHERE session_id = ?", (session_id,))
+        ip = network_data.get('ip', '')
+        
+        # Check if this exact network state already exists recently (within 1 min)
+        one_min_ago = timestamp - 60
+        cursor.execute("""
+            SELECT id FROM local_network 
+            WHERE session_id = ? AND ip_address = ? AND timestamp > ?
+        """, (session_id, ip, one_min_ago))
+        
+        if cursor.fetchone():
+            return  # Skip if same IP logged recently
         
         cursor.execute("""
             INSERT INTO local_network
@@ -326,7 +337,7 @@ class LocalDatabase:
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
             session_id,
-            network_data.get('ip'),
+            ip,
             network_data.get('gateway'),
             json.dumps(network_data.get('dns', [])),
             network_data.get('activeConnections', 0),
@@ -337,27 +348,24 @@ class LocalDatabase:
     
     # Terminal methods
     def insert_terminal_event(self, session_id, event_data):
-        """Insert a terminal event - deduplicate by command+host combination."""
+        """Insert a terminal event - append-only, exact match deduplication."""
         detected_at = datetime.now(timezone.utc).timestamp()
         cursor = self.conn.cursor()
         
-        # Create a unique key for deduplication
-        cmd = event_data.get('full_command', '')[:100]  # Truncate for comparison
-        host = event_data.get('remote_host', event_data.get('remote_ip', ''))
         tool = event_data.get('tool', 'unknown')
-        dup_key = f"{tool}:{host}:{cmd}"
+        cmd = event_data.get('full_command', '')
+        host = event_data.get('remote_host', event_data.get('remote_ip', ''))
         
-        # Check if similar event exists in last 5 minutes (avoid duplicates)
-        five_min_ago = detected_at - 300
+        # Check for exact duplicate (same tool, command, host, time within 1 second)
+        time_key = int(detected_at)
         cursor.execute("""
             SELECT id FROM local_terminal_events 
             WHERE session_id = ? AND tool = ? AND remote_host = ? 
-            AND full_command LIKE ? AND detected_at > ?
-        """, (session_id, tool, host, cmd[:50] + '%', five_min_ago))
+            AND full_command = ? AND CAST(detected_at AS INTEGER) = ?
+        """, (session_id, tool, host, cmd, time_key))
         
         if cursor.fetchone():
-            # Similar recent event exists, skip
-            return
+            return  # Exact duplicate exists
         
         cursor.execute("""
             INSERT INTO local_terminal_events
@@ -372,7 +380,7 @@ class LocalDatabase:
             event_data.get('remote_port'),
             event_data.get('pid'),
             event_data.get('event_type', 'terminal_request'),
-            event_data.get('full_command'),
+            cmd,
             event_data.get('risk_level', 'medium'),
             event_data.get('message'),
             detected_at
@@ -382,13 +390,12 @@ class LocalDatabase:
     
     # Browser history methods
     def insert_browser_history(self, session_id, urls):
-        """Insert browser history - only new URLs, update existing ones."""
+        """Insert browser history - append-only, skip existing URLs."""
         if not urls:
             return
             
         cursor = self.conn.cursor()
         inserted = 0
-        updated = 0
         
         for url_data in urls:
             url = url_data.get('url')
@@ -402,36 +409,25 @@ class LocalDatabase:
             """, (session_id, url))
             
             if cursor.fetchone():
-                # Update last_visited time only
-                cursor.execute("""
-                    UPDATE local_browser_history 
-                    SET last_visited = ?, visit_count = MAX(visit_count, ?)
-                    WHERE session_id = ? AND url = ?
-                """, (
-                    url_data.get('last_visited', datetime.now(timezone.utc).timestamp()),
-                    url_data.get('visit_count', 1),
-                    session_id,
-                    url
-                ))
-                updated += 1
-            else:
-                # Insert new URL
-                cursor.execute("""
-                    INSERT INTO local_browser_history
-                    (session_id, url, title, visit_count, last_visited, browser)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    session_id,
-                    url,
-                    url_data.get('title', '')[:200],  # Limit title length
-                    url_data.get('visit_count', 1),
-                    url_data.get('last_visited', datetime.now(timezone.utc).timestamp()),
-                    url_data.get('browser', 'Unknown')
-                ))
-                inserted += 1
+                continue  # Skip existing URLs (append-only)
+            
+            # Insert new URL only
+            cursor.execute("""
+                INSERT INTO local_browser_history
+                (session_id, url, title, visit_count, last_visited, browser)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                session_id,
+                url,
+                url_data.get('title', '')[:200],
+                url_data.get('visit_count', 1),
+                url_data.get('last_visited', datetime.now(timezone.utc).timestamp()),
+                url_data.get('browser', 'Unknown')
+            ))
+            inserted += 1
         
         self.conn.commit()
-        return {'inserted': inserted, 'updated': updated}
+        return {'inserted': inserted}
     
     # Sync methods
     def get_unsynced_processes(self, session_id):
@@ -533,23 +529,28 @@ class LocalDatabase:
         
         return [dict(row) for row in cursor.fetchall()]
     
-    def cleanup_old_data(self, session_id, max_age_hours=24):
-        """Clean up old data to keep database lean.
+    def cleanup_old_data(self, session_id, max_age_days=30):
+        """Clean up very old data after session ends.
         
-        Only keeps recent data (last 24 hours by default).
-        Processes and network are already current-state only.
+        Keeps data for 30 days by default - only cleans up after exam is complete.
+        This is append-only during the exam, cleanup happens post-session.
         """
-        cursor = self.conn.cursor()
-        cutoff = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
+        # Check if session is still active - don't cleanup during exam
+        active = self.get_active_session()
+        if active and active.get('session_id') == session_id:
+            return {'skipped': 'session_active'}  # Don't cleanup during exam
         
-        # Clean old terminal events (keep last 24h)
+        cursor = self.conn.cursor()
+        cutoff = datetime.now(timezone.utc).timestamp() - (max_age_days * 86400)
+        
+        # Clean very old terminal events (only after session ends)
         cursor.execute("""
             DELETE FROM local_terminal_events 
             WHERE session_id = ? AND detected_at < ?
         """, (session_id, cutoff))
         terminal_deleted = cursor.rowcount
         
-        # Clean old browser history (keep last 24h)
+        # Clean very old browser history (only after session ends)
         cursor.execute("""
             DELETE FROM local_browser_history 
             WHERE session_id = ? AND last_visited < ?
@@ -562,7 +563,7 @@ class LocalDatabase:
         self.conn.commit()
         
         if terminal_deleted > 0 or browser_deleted > 0:
-            log.info(f"Cleaned up {terminal_deleted} old terminal events, {browser_deleted} old browser URLs")
+            log.info(f"Post-session cleanup: {terminal_deleted} terminal events, {browser_deleted} browser URLs (> {max_age_days} days)")
         
         return {'terminal_deleted': terminal_deleted, 'browser_deleted': browser_deleted}
     

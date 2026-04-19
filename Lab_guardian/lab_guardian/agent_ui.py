@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
     QStatusBar, QFrame, QSplitter, QFileDialog
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject, QSettings
 from PyQt5.QtGui import QFont, QColor, QIcon
 import logging
 
@@ -159,8 +159,16 @@ class AgentMainWindow(QMainWindow):
     
     def setup_ui(self):
         self.setWindowTitle("Lab Guardian - Exam Monitoring Agent")
-        self.setMinimumSize(1000, 750)
+        self.setMinimumSize(900, 650)
         self.setStyleSheet(self.get_stylesheet())
+        
+        # Restore saved window geometry
+        settings = QSettings("LabGuardian", "AgentUI")
+        saved_size = settings.value("window/size")
+        if saved_size:
+            self.resize(saved_size)
+        else:
+            self.resize(1200, 800)
         
         # Central widget
         central_widget = QWidget()
@@ -219,7 +227,7 @@ class AgentMainWindow(QMainWindow):
         config_layout.addRow("", self.start_btn)
         
         self.config_group.setLayout(config_layout)
-        main_layout.addWidget(self.config_group)
+        main_layout.addWidget(self.config_group, 0)
         
         # ===== SESSION INFO PANEL (Hidden initially) =====
         self.session_group = QGroupBox("📊 Session Information")
@@ -267,7 +275,7 @@ class AgentMainWindow(QMainWindow):
         session_layout.addWidget(self.end_btn)
         
         self.session_group.setLayout(session_layout)
-        main_layout.addWidget(self.session_group)
+        main_layout.addWidget(self.session_group, 0)
         
         # Duration timer
         self.duration_timer = QTimer()
@@ -276,33 +284,37 @@ class AgentMainWindow(QMainWindow):
         # ===== MONITORING TABS =====
         self.tab_widget = QTabWidget()
         self.tab_widget.setVisible(False)
-        self.tab_widget.setMinimumHeight(400)
+        self.tab_widget.setMinimumHeight(300)
         
-        # Processes Tab
+        # Processes Tab - append-only tracking
         self.process_table = self.create_activity_table([
-            "Count", "Process Name", "CPU %", "Memory (MB)", "Risk", "Status"
+            "Count", "Process Name", "Risk", "Status"
         ])
+        self._seen_processes = set()  # Track seen process names
         self.tab_widget.addTab(self.process_table, "📊 Processes")
         
-        # Browser History Tab
+        # Browser History Tab - append-only tracking
         self.browser_table = self.create_activity_table([
             "URL", "Title", "Browser", "Visits", "Last Visited"
         ])
+        self._seen_urls = set()  # Track seen URLs
         self.tab_widget.addTab(self.browser_table, "🌐 Browser History")
         
-        # Terminal Tab
+        # Terminal Tab - append-only tracking
         self.terminal_table = self.create_activity_table([
             "Tool", "Command/Connection", "Risk", "Type", "Time"
         ])
+        self._seen_terminal = set()  # Track seen terminal events
         self.tab_widget.addTab(self.terminal_table, "💻 Terminal Activity")
         
-        # Devices Tab
+        # Devices Tab - append-only tracking
         self.devices_table = self.create_activity_table([
             "Device Name", "Type", "Risk", "Status", "Connected At"
         ])
+        self._seen_devices = set()  # Track seen device IDs
         self.tab_widget.addTab(self.devices_table, "🔌 USB Devices")
         
-        main_layout.addWidget(self.tab_widget)
+        main_layout.addWidget(self.tab_widget, 1)  # Stretch factor 1 for auto-resize
     
     def setup_status_bar(self):
         self.statusBar = QStatusBar()
@@ -398,15 +410,46 @@ class AgentMainWindow(QMainWindow):
         """
     
     def create_activity_table(self, columns):
-        """Create a styled table for activity display."""
+        """Create a styled table for activity display with auto-resize."""
         table = QTableWidget()
         table.setColumnCount(len(columns))
         table.setHorizontalHeaderLabels(columns)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # Use Interactive mode for better resize behavior
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setDefaultSectionSize(28)
         table.setAlternatingRowColors(True)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         return table
+    
+    def resizeEvent(self, event):
+        """Handle window resize - auto-resize table columns."""
+        super().resizeEvent(event)
+        # Resize columns proportionally to window width
+        tables = [self.process_table, self.browser_table, self.terminal_table, self.devices_table]
+        for table in tables:
+            if table and table.isVisible():
+                width = table.viewport().width()
+                col_count = table.columnCount()
+                if col_count > 0 and width > 0:
+                    # First column small, second gets most space, rest equal
+                    for i in range(col_count):
+                        if i == 0:
+                            table.setColumnWidth(i, int(width * 0.12))  # Count
+                        elif i == 1:  # Name/URL column gets most space
+                            table.setColumnWidth(i, int(width * 0.40))
+                        else:
+                            table.setColumnWidth(i, int(width * 0.16))  # Risk, Status, etc
+    
+    def trigger_initial_resize(self):
+        """Trigger initial column resize for all tables."""
+        # Force a resize event to set initial column widths
+        self.resizeEvent(None)
+        # Also resize for current active tab specifically
+        current_table = self.tab_widget.currentWidget()
+        if isinstance(current_table, QTableWidget):
+            current_table.resizeColumnsToContents()
     
     def start_internet_checker(self):
         """Start timer to check internet connectivity."""
@@ -458,8 +501,12 @@ class AgentMainWindow(QMainWindow):
         # Start duration timer
         self.duration_timer.start(1000)
         
-        # Update monitoring status
+        # Show monitoring tabs
+        self.tab_widget.setVisible(True)
         self.indicator_monitoring.set_status("Monitoring", "green")
+        
+        # Trigger initial column resize
+        QTimer.singleShot(100, self.trigger_initial_resize)
         
         self.statusBar.showMessage(f"Exam session started for {self.roll_no} in {self.lab_no}")
         
@@ -507,43 +554,29 @@ class AgentMainWindow(QMainWindow):
             self.status_duration.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
     
     def on_processes_update(self, processes):
-        """Update process table with grouped process data.
+        """Update process table - append new processes, don't clear existing.
         
-        Groups processes by name, showing aggregated stats:
-        - Count: number of instances
-        - CPU %: sum of all instances
-        - Memory: sum of all instances
-        - Risk: highest risk level among instances
+        Shows unique processes as they appear, no resource consumption stats.
         """
-        self.process_table.setRowCount(0)
-        
         # Group processes by name
         grouped = {}
         for proc in processes:
             name = proc.get('process_name', 'Unknown')
-            # Check if any instance is incognito
             is_incognito = proc.get('is_incognito', False) or proc.get('category') == 'incognito'
             
             if name not in grouped:
                 grouped[name] = {
                     'count': 0,
-                    'cpu_percent': 0.0,
-                    'memory_mb': 0.0,
                     'risk_level': 'low',
-                    'status': 'running',
                     'has_incognito': False
                 }
             
             g = grouped[name]
             g['count'] += 1
-            g['cpu_percent'] += proc.get('cpu_percent', 0)
-            g['memory_mb'] += proc.get('memory_mb', 0)
             
-            # Track if any instance is incognito
             if is_incognito:
                 g['has_incognito'] = True
             
-            # Keep highest risk level
             risk = proc.get('risk_level', 'normal')
             if risk == 'high' or g['risk_level'] == 'high':
                 g['risk_level'] = 'high'
@@ -552,28 +585,23 @@ class AgentMainWindow(QMainWindow):
             else:
                 g['risk_level'] = risk
         
-        # Sort by risk level (high first), then by CPU usage
-        risk_order = {'high': 0, 'medium': 1, 'low': 2, 'normal': 3}
-        sorted_processes = sorted(
-            grouped.items(),
-            key=lambda x: (risk_order.get(x[1]['risk_level'], 3), -x[1]['cpu_percent'])
-        )
-        
-        for name, data in sorted_processes:
+        # Only add new processes (not already seen)
+        for name, data in grouped.items():
+            key = name  # Use process name as unique key
+            if key in self._seen_processes:
+                continue  # Skip if already logged
+            
+            self._seen_processes.add(key)
             row = self.process_table.rowCount()
             self.process_table.insertRow(row)
             
-            # Count with instance indicator
             count_text = str(data['count']) if data['count'] == 1 else f"{data['count']}"
             self.process_table.setItem(row, 0, QTableWidgetItem(count_text))
             
-            # Show incognito indicator in process name
             display_name = name
             if data.get('has_incognito'):
                 display_name = f"{name} 🔒 (Private/Incognito)"
             self.process_table.setItem(row, 1, QTableWidgetItem(display_name))
-            self.process_table.setItem(row, 2, QTableWidgetItem(f"{data['cpu_percent']:.1f}%"))
-            self.process_table.setItem(row, 3, QTableWidgetItem(f"{data['memory_mb']:.1f}"))
             
             risk = data['risk_level']
             risk_item = QTableWidgetItem(risk.upper())
@@ -581,20 +609,22 @@ class AgentMainWindow(QMainWindow):
                 risk_item.setForeground(QColor("#ef4444"))
             elif risk == 'medium':
                 risk_item.setForeground(QColor("#f59e0b"))
-            self.process_table.setItem(row, 4, risk_item)
+            self.process_table.setItem(row, 2, risk_item)
             
-            status_text = "Running" if data['count'] > 0 else "Stopped"
-            self.process_table.setItem(row, 5, QTableWidgetItem(status_text))
+            self.process_table.setItem(row, 3, QTableWidgetItem("Running"))
     
     def on_browser_update(self, urls):
-        """Update browser history table."""
-        self.browser_table.setRowCount(0)
-        
+        """Update browser history table - append new URLs, don't clear existing."""
         for url_data in urls:
+            url = url_data.get('url', '')
+            if url in self._seen_urls:
+                continue  # Skip if already logged
+            
+            self._seen_urls.add(url)
             row = self.browser_table.rowCount()
             self.browser_table.insertRow(row)
             
-            self.browser_table.setItem(row, 0, QTableWidgetItem(url_data.get('url', '')))
+            self.browser_table.setItem(row, 0, QTableWidgetItem(url))
             self.browser_table.setItem(row, 1, QTableWidgetItem(url_data.get('title', '')))
             self.browser_table.setItem(row, 2, QTableWidgetItem(url_data.get('browser', '')))
             self.browser_table.setItem(row, 3, QTableWidgetItem(str(url_data.get('visit_count', 0))))
@@ -605,14 +635,22 @@ class AgentMainWindow(QMainWindow):
                 self.browser_table.setItem(row, 4, QTableWidgetItem(dt.strftime("%H:%M:%S")))
     
     def on_terminal_update(self, events):
-        """Update terminal events table."""
-        self.terminal_table.setRowCount(0)
-        
+        """Update terminal events table - append new events, don't clear existing."""
         for event in events:
+            # Create unique key from tool + command + time (within 1 second)
+            tool = event.get('tool', '')
+            cmd = event.get('full_command', '') or f"{event.get('remote_ip', '')}:{event.get('remote_port', '')}"
+            detected_at = event.get('detected_at', 0)
+            key = f"{tool}:{cmd}:{int(detected_at)}"
+            
+            if key in self._seen_terminal:
+                continue  # Skip if already logged
+            
+            self._seen_terminal.add(key)
             row = self.terminal_table.rowCount()
             self.terminal_table.insertRow(row)
             
-            self.terminal_table.setItem(row, 0, QTableWidgetItem(event.get('tool', '')))
+            self.terminal_table.setItem(row, 0, QTableWidgetItem(tool))
             
             if event.get('full_command'):
                 self.terminal_table.setItem(row, 1, QTableWidgetItem(event.get('full_command', '')))
@@ -630,16 +668,18 @@ class AgentMainWindow(QMainWindow):
             
             self.terminal_table.setItem(row, 3, QTableWidgetItem(event.get('event_type', '')))
             
-            detected_at = event.get('detected_at')
             if detected_at:
                 dt = datetime.fromtimestamp(detected_at)
                 self.terminal_table.setItem(row, 4, QTableWidgetItem(dt.strftime("%H:%M:%S")))
     
     def on_devices_update(self, devices):
-        """Update devices table."""
-        self.devices_table.setRowCount(0)
-        
+        """Update devices table - append new devices, don't clear existing."""
         for device in devices:
+            device_id = device.get('device_id', '')
+            if device_id in self._seen_devices:
+                continue  # Skip if already logged
+            
+            self._seen_devices.add(device_id)
             row = self.devices_table.rowCount()
             self.devices_table.insertRow(row)
             
@@ -652,7 +692,7 @@ class AgentMainWindow(QMainWindow):
                 risk_item.setForeground(QColor("#ef4444"))
             self.devices_table.setItem(row, 2, risk_item)
             
-            status = "Disconnected" if device.get('disconnected_at') else "Connected"
+            status = "Connected"  # Only show newly connected devices
             self.devices_table.setItem(row, 3, QTableWidgetItem(status))
             
             connected_at = device.get('connected_at')
@@ -661,7 +701,11 @@ class AgentMainWindow(QMainWindow):
                 self.devices_table.setItem(row, 4, QTableWidgetItem(dt.strftime("%H:%M:%S")))
     
     def closeEvent(self, event):
-        """Handle window close event."""
+        """Handle window close event and save window geometry."""
+        # Save window size
+        settings = QSettings("LabGuardian", "AgentUI")
+        settings.setValue("window/size", self.size())
+        
         if self.exam_started:
             reply = QMessageBox.question(
                 self,

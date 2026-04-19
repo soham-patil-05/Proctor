@@ -1,11 +1,13 @@
 README.md
 setup.py
 lab_guardian/__init__.py
-lab_guardian/api.py
+lab_guardian/__main__.py
+lab_guardian/agent_ui.py
 lab_guardian/cli.py
 lab_guardian/config.py
 lab_guardian/dispatcher.py
-lab_guardian/ws_client.py
+lab_guardian/local_db.py
+lab_guardian/sync_manager.py
 lab_guardian.egg-info/PKG-INFO
 lab_guardian.egg-info/SOURCES.txt
 lab_guardian.egg-info/dependency_links.txt
@@ -13,6 +15,7 @@ lab_guardian.egg-info/entry_points.txt
 lab_guardian.egg-info/requires.txt
 lab_guardian.egg-info/top_level.txt
 lab_guardian/monitor/__init__.py
+lab_guardian/monitor/browser_history.py
 lab_guardian/monitor/device_monitor.py
 lab_guardian/monitor/network_monitor.py
 lab_guardian/monitor/process_monitor.py

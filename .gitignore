@@ -1,6 +1,204 @@
+# ============================================
+# Python
+# ============================================
 venv/
+env/
+ENV/
+.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================
+# Node.js
+# ============================================
 node_modules/
-.env
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.npm
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+
+# ============================================
+# Frontend Build Output
+# ============================================
+frontend/dist/
+frontend/dist-ssr/
+frontend/build/
+*.local
+
+# ============================================
+# Backend
+# ============================================
+backend/node_modules/
+backend/dist/
+backend/build/
+backend/coverage/
+
+# ============================================
+# Lab Guardian Agent
+# ============================================
 Lab_guardian/venv/
+Lab_guardian/__pycache__/
+Lab_guardian/*.pyc
+Lab_guardian/*.pyo
+Lab_guardian/*.pyd
+Lab_guardian/.Python
+Lab_guardian/build/
+Lab_guardian/develop-eggs/
+Lab_guardian/dist/
+Lab_guardian/*.egg-info/
+Lab_guardian/.installed.cfg
+Lab_guardian/*.egg
+Lab_guardian/*.spec
+Lab_guardian/*.db
+Lab_guardian/*.sqlite
+Lab_guardian/*.sqlite3
+Lab_guardian/exam_data.db
+Lab_guardian/*.log
+
+# ============================================
+# IDE & Editors
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.code-workspace
+.history/
+
+# ============================================
+# Environment & Secrets
+# ============================================
+.env
+.env.local
+.env.*.local
+.env.development
+.env.test
+.env.production
+*.pem
+*.key
+*.crt
+secrets/
+config.json
+secrets.json
+
+# ============================================
+# Logs & Databases
+# ============================================
+*.log
+logs/
+log/
+*.sql
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# ============================================
+# Testing & Coverage
+# ============================================
+.coverage
+.tox/
+.nox/
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# ============================================
+# Temporary Files
+# ============================================
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+*.rej
+*.diff
+
+# ============================================
+# OS Generated
+# ============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ============================================
+# Misc
+# ============================================
+*.pid
+*.seed
+*.pid.lock
+.eslintcache
+.stylelintcache
+.parcel-cache
+.next
+.nuxt
+.docusaurus
+.serverless/
+.fusebox/
+.dynamodb/
+.tern-port
+.vscode-test
+
+# ============================================
+# Project Specific
+# ============================================
+# Build scripts artifacts
+Lab_guardian/build_deb.sh
+Lab_guardian/rebuild.sh
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# Audit logs (large files)
+*.audit.log
+audit.log

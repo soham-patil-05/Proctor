@@ -136,14 +136,15 @@ async def run_with_ui(local_db, ui_window, backend_url=None):
             await asyncio.sleep(5)
     
     async def cleanup_task():
-        """Periodically clean old data to keep DB lean."""
+        """Periodically clean old data - only runs after session ends."""
         while True:
-            await asyncio.sleep(300)  # Every 5 minutes
+            await asyncio.sleep(3600)  # Every hour (cleanup only runs post-session)
             if session_id:
                 try:
-                    result = local_db.cleanup_old_data(session_id, max_age_hours=24)
-                    size = local_db.get_db_size()
-                    log.debug(f"DB cleanup: {result}, size={size/1024:.1f}KB")
+                    result = local_db.cleanup_old_data(session_id, max_age_days=30)
+                    if 'skipped' not in result:
+                        size = local_db.get_db_size()
+                        log.debug(f"DB cleanup: {result}, size={size/1024:.1f}KB")
                 except Exception as e:
                     log.error(f"Cleanup error: {e}")
     
