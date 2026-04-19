@@ -1,168 +1,73 @@
-const API_BASE = import.meta.env.VITE_API_BASE;
+// API service for Lab Guardian offline-first dashboard
 
-const getToken = () => {
-  return localStorage.getItem('token');
-};
+const API_BASE = import.meta.env.VITE_API_BASE || '';
 
-const handleResponse = async (response) => {
-  if (response.status === 401) {
-    localStorage.removeItem('token');
-    localStorage.removeItem('teacherName');
-    window.location.href = '/login';
-    throw new Error('Unauthorized');
-  }
-
+/**
+ * Fetch all active students grouped by start time
+ * @param {Object} filters - Optional filters
+ * @param {string} filters.lab_no - Filter by lab number
+ * @param {string} filters.time_from - Filter by start time
+ * @param {string} filters.time_to - Filter by end time
+ */
+export async function fetchDashboardStudents(filters = {}) {
+  const params = new URLSearchParams();
+  
+  if (filters.lab_no) params.append('lab_no', filters.lab_no);
+  if (filters.time_from) params.append('time_from', filters.time_from);
+  if (filters.time_to) params.append('time_to', filters.time_to);
+  
+  const response = await fetch(`${API_BASE}/api/dashboard/students?${params}`);
+  
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Network error' }));
-    throw new Error(error.error || 'Request failed');
+    throw new Error(`Failed to fetch students: ${response.statusText}`);
   }
-
+  
   return response.json();
-};
+}
 
-export const api = {
-  auth: {
-    login: async (email, password) => {
-      const response = await fetch(`${API_BASE}/auth/login`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ email, password }),
-      });
-      return handleResponse(response);
-    },
-    register: async(name,email,password)=>{
-      const response = await fetch(`${API_BASE}/auth/register`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ name,email, password }),
-      });
-      return handleResponse(response);
-    }
-  },
+/**
+ * Fetch detailed activity for a specific student session
+ * @param {string} sessionId - The session UUID
+ */
+export async function fetchStudentDetails(sessionId) {
+  const response = await fetch(`${API_BASE}/api/dashboard/student/${sessionId}`);
+  
+  if (!response.ok) {
+    throw new Error(`Failed to fetch student details: ${response.statusText}`);
+  }
+  
+  return response.json();
+}
 
-  subjects: {
-    getAll: async () => {
-      const response = await fetch(`${API_BASE}/teacher/subjects`, {
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      return handleResponse(response);
+/**
+ * End all active exam sessions
+ * @param {string} secretKey - The secret key (80085)
+ */
+export async function endAllSessions(secretKey) {
+  const response = await fetch(`${API_BASE}/api/exam/end-all`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
     },
+    body: JSON.stringify({ secret_key: secretKey }),
+  });
+  
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.error || 'Failed to end sessions');
+  }
+  
+  return response.json();
+}
 
-    create: async (subjectData) => {
-      const response = await fetch(`${API_BASE}/teacher/subjects`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(subjectData),
-      });
-      return handleResponse(response);
-    },
-  },
-
-  sessions: {
-    create: async (sessionData) => {
-      const response = await fetch(`${API_BASE}/teacher/sessions`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(sessionData),
-      });
-      return handleResponse(response);
-    },
-
-    getAll: async (status = 'all') => {
-      const response = await fetch(`${API_BASE}/teacher/sessions?status=${status}`, {
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      return handleResponse(response);
-    },
-
-    getById: async (sessionId) => {
-      const response = await fetch(`${API_BASE}/teacher/sessions/${sessionId}`, {
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      return handleResponse(response);
-    },
-
-    end: async (sessionId) => {
-      const response = await fetch(`${API_BASE}/teacher/sessions/${sessionId}/end`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({}),
-      });
-      return handleResponse(response);
-    },
-
-    getStudents: async (sessionId) => {
-      const response = await fetch(`${API_BASE}/teacher/sessions/${sessionId}/students`, {
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      return handleResponse(response);
-    },
-  },
-
-  students: {
-    getById: async (rollNo) => {
-      const response = await fetch(`${API_BASE}/teacher/students/${rollNo}`, {
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      return handleResponse(response);
-    },
-
-    getDevices: async (rollNo) => {
-      const response = await fetch(`${API_BASE}/teacher/students/${rollNo}/devices`, {
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      return handleResponse(response);
-    },
-
-    getNetwork: async (rollNo) => {
-      const response = await fetch(`${API_BASE}/teacher/students/${rollNo}/network`, {
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      return handleResponse(response);
-    },
-
-    getDomainActivity: async (rollNo) => {
-      const response = await fetch(`${API_BASE}/teacher/students/${rollNo}/domain-activity`, {
-        headers: {
-          'Authorization': `Bearer ${getToken()}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      return handleResponse(response);
-    },
-  },
-};
+/**
+ * Check backend health
+ */
+export async function checkHealth() {
+  try {
+    const response = await fetch(`${API_BASE}/api/health`);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}

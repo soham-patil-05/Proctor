@@ -554,28 +554,31 @@ class AgentMainWindow(QMainWindow):
             self.status_duration.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
     
     def on_processes_update(self, processes):
-        """Update process table - append new processes, don't clear existing.
+        """Update process table - append new unique processes only.
         
-        Shows unique processes as they appear, no resource consumption stats.
+        Chrome and Chrome Incognito are shown as SEPARATE entries.
+        Firefox and Firefox Private are shown as SEPARATE entries.
+        Same process name is never duplicated.
         """
-        # Group processes by name
+        # Group processes by (name, is_incognito)
         grouped = {}
         for proc in processes:
             name = proc.get('process_name', 'Unknown')
             is_incognito = proc.get('is_incognito', False) or proc.get('category') == 'incognito'
             
-            if name not in grouped:
-                grouped[name] = {
+            # Create unique key: name + incognito status
+            key = f"{name}|incognito={is_incognito}"
+            
+            if key not in grouped:
+                grouped[key] = {
+                    'name': name,
                     'count': 0,
                     'risk_level': 'low',
-                    'has_incognito': False
+                    'is_incognito': is_incognito
                 }
             
-            g = grouped[name]
+            g = grouped[key]
             g['count'] += 1
-            
-            if is_incognito:
-                g['has_incognito'] = True
             
             risk = proc.get('risk_level', 'normal')
             if risk == 'high' or g['risk_level'] == 'high':
@@ -586,8 +589,8 @@ class AgentMainWindow(QMainWindow):
                 g['risk_level'] = risk
         
         # Only add new processes (not already seen)
-        for name, data in grouped.items():
-            key = name  # Use process name as unique key
+        for key, data in grouped.items():
+            # Use the key as unique identifier
             if key in self._seen_processes:
                 continue  # Skip if already logged
             
@@ -595,14 +598,15 @@ class AgentMainWindow(QMainWindow):
             row = self.process_table.rowCount()
             self.process_table.insertRow(row)
             
+            # Count column
             count_text = str(data['count']) if data['count'] == 1 else f"{data['count']}"
             self.process_table.setItem(row, 0, QTableWidgetItem(count_text))
             
-            display_name = name
-            if data.get('has_incognito'):
-                display_name = f"{name} 🔒 (Private/Incognito)"
+            # Process name column - already formatted from database
+            display_name = data['name']
             self.process_table.setItem(row, 1, QTableWidgetItem(display_name))
             
+            # Risk level column
             risk = data['risk_level']
             risk_item = QTableWidgetItem(risk.upper())
             if risk == 'high':
@@ -611,6 +615,7 @@ class AgentMainWindow(QMainWindow):
                 risk_item.setForeground(QColor("#f59e0b"))
             self.process_table.setItem(row, 2, risk_item)
             
+            # Status column
             self.process_table.setItem(row, 3, QTableWidgetItem("Running"))
     
     def on_browser_update(self, urls):

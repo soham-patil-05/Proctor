@@ -1,204 +1,179 @@
-# Teacher Lab Monitoring System
+# Lab Guardian - Teacher Dashboard
 
-A comprehensive teacher-facing Single Page Application (SPA) for monitoring and managing lab sessions with real-time student activity tracking.
+A simple, no-login React dashboard for monitoring offline-first exam sessions.
 
 ## Features
 
-- **Authentication**: Secure login system with Bearer token authentication
-- **Dashboard**: Overview of subjects, sessions, and live session status
-- **Subject Management**: Create and manage subjects with department and year information
-- **Session Management**: Create, monitor, and end lab sessions
-- **Live Student Monitoring**: Real-time tracking of student activities with virtualized list for performance
-- **Student Details**: Detailed view with WebSocket-powered live process monitoring, device tracking, and network information
-- **Responsive Design**: Professional college aesthetic with navy blue theme
+- ✅ **No authentication required** - Direct access for teachers
+- ✅ **Auto-refresh** - Updates every 5 seconds via HTTP polling
+- ✅ **Student grouping** - Students grouped by start time
+- ✅ **Filters** - Filter by lab number and time range
+- ✅ **Detailed view** - Click student to see all activity
+- ✅ **End sessions** - Secret key protected session termination
 
-## Technology Stack
+## Tech Stack
 
-- **Frontend Framework**: React 18 with Vite
-- **Routing**: React Router DOM
-- **Styling**: Tailwind CSS with custom design tokens
-- **Real-time Communication**: WebSocket with automatic reconnection
-- **UI Components**: Custom component library with accessible, reusable components
-- **Performance**: React Window for virtualized lists
+- React 18
+- Vite 5
+- React Router 6
+- Vanilla CSS (no frameworks)
 
-## Environment Setup
+## Setup
 
-The application requires the following environment variables to be set in `.env`:
-
-```
-VITE_API_BASE=https://localhost:8000/api
-VITE_WS_BASE=wss://localhost:8000
-```
-
-These are already configured in the `.env` file.
-
-## Backend Requirements
-
-The application expects a backend server running at `https://localhost:8000` with the following endpoints:
-
-### Authentication
-- `POST /api/auth/login` - User login
-
-### Subjects
-- `GET /api/teacher/subjects` - Get all subjects
-- `POST /api/teacher/subjects` - Create new subject
-
-### Sessions
-- `POST /api/teacher/sessions` - Create new session
-- `GET /api/teacher/sessions?status={all|live|ended}` - Get sessions
-- `GET /api/teacher/sessions/:sessionId` - Get session details
-- `POST /api/teacher/sessions/:sessionId/end` - End session
-- `GET /api/teacher/sessions/:sessionId/students` - Get session students
-
-### Students
-- `GET /api/teacher/students/:rollNo` - Get student details
-- `GET /api/teacher/students/:rollNo/devices` - Get student devices
-- `GET /api/teacher/students/:rollNo/network` - Get student network info
-
-### WebSocket
-- `wss://localhost:8000/ws/sessions/:sessionId/students/:rollNo/processes` - Live process monitoring
-
-## Installation
+### 1. Install dependencies
 
 ```bash
+cd frontend
 npm install
 ```
 
-## Development
+### 2. Configure environment
+
+Edit `.env` file:
+
+```env
+VITE_API_BASE=http://localhost:8000
+```
+
+### 3. Start development server
 
 ```bash
 npm run dev
 ```
 
-The development server will start. Note: The backend server must be running at `https://localhost:8000` for the application to function properly.
+Dashboard opens at: http://localhost:5173
 
-## Build
+### 4. Build for production
 
 ```bash
 npm run build
 ```
 
-This will create a production build in the `dist` directory.
+Production files will be in `dist/` folder.
 
-## Preview Production Build
+### 5. Preview production build
 
 ```bash
 npm run preview
 ```
 
+## Usage
+
+### Dashboard View
+
+1. **View active students** - Students appear automatically as they start exams
+2. **Filter by lab** - Use the dropdown to filter by lab number (L01-L12)
+3. **Filter by time** - Use date pickers to filter by time range
+4. **Click student card** - View detailed activity for that student
+
+### Student Detail View
+
+- **Processes Tab** - All running processes with risk levels
+- **Devices Tab** - USB/external device connections
+- **Terminal Tab** - Terminal commands and network connections
+- **Browser Tab** - Visited URLs and browser history
+
+### End All Sessions
+
+1. Click "End All Sessions" button
+2. Enter secret key: `80085`
+3. Click "End All Sessions" to confirm
+4. All active sessions will be terminated
+
+## API Endpoints Used
+
+- `GET /api/dashboard/students` - Get all active students
+- `GET /api/dashboard/student/:sessionId` - Get student details
+- `POST /api/exam/end-all` - End all sessions
+
+## Auto-Refresh
+
+The dashboard automatically refreshes data every 5 seconds to show real-time updates from student agents.
+
 ## Project Structure
 
 ```
-src/
-├── assets/              # Static assets (logos, icons)
-├── components/
-│   ├── layout/         # Layout components (Sidebar, Topbar, LiveSessionBanner)
-│   ├── ui/             # Reusable UI components (Button, Card, Modal, etc.)
-│   └── session/        # Session-specific components
-├── pages/              # Page components
-│   ├── Login.jsx
-│   ├── Dashboard.jsx
-│   ├── MySubjects.jsx
-│   ├── CreateSession.jsx
-│   ├── MySessions.jsx
-│   ├── LiveSession.jsx
-│   └── StudentDetails.jsx
-├── services/
-│   ├── api.js          # HTTPS API service
-│   └── socket.js       # WebSocket service with reconnection
-├── context/
-│   └── SessionContext.jsx  # Session state management
-├── styles/
-│   └── tokens.css      # Design tokens and theme variables
-├── App.jsx             # Main app component with routing
-└── routes.jsx          # Route definitions
+frontend/
+├── src/
+│   ├── main.jsx                    # Entry point
+│   ├── App.jsx                     # Main app with routing
+│   ├── index.css                   # Global styles
+│   ├── services/
+│   │   └── api.js                  # API service functions
+│   ├── pages/
+│   │   ├── Dashboard.jsx           # Main dashboard page
+│   │   └── StudentDetail.jsx       # Student detail page
+│   └── components/
+│       └── EndSessionModal.jsx     # End session modal
+├── index.html
+├── vite.config.js
+├── package.json
+└── .env
 ```
 
-## Key Features Implementation
+## Deployment
 
-### Authentication
-- Token-based authentication stored in localStorage
-- Protected routes with automatic redirect to login
-- Automatic logout on 401 responses
+### Option 1: Static Hosting
 
-### Live Session Banner
-- Persistent banner displayed across all pages when a session is active
-- Click to resume session
-- Pulse animation for visual feedback
+Build the project and serve the `dist/` folder with any static web server:
 
-### Student List Virtualization
-- React Window for efficient rendering of large student lists
-- Debounced search (300ms) for filtering by roll number
-- Smooth scrolling and hover effects
+```bash
+npm run build
+# Serve dist/ folder with nginx, apache, etc.
+```
 
-### WebSocket Connection
-- Automatic connection on Student Details page
-- Reconnection logic with exponential backoff
-- Heartbeat monitoring (10s timeout)
-- Visual connection status indicators
-- Process event handling: snapshot, new, update, end
+### Option 2: Node.js Server
 
-### Real-time Process Monitoring
-- Flash highlight for new processes
-- CPU increase detection (>30%) with visual feedback
-- Graceful handling of ended processes
-- Update throttling for performance
+Use a simple Node.js server to serve the built files:
 
-## Design System
+```bash
+npm run build
+npx serve dist
+```
 
-### Colors
-- **Primary**: Navy blue (#0a2540)
-- **Secondary**: Gray tones
-- **Accent**: Blue (#2563eb)
-- **Success**: Green (#10b981)
-- **Warning**: Orange (#f59e0b)
-- **Error**: Red (#ef4444)
+### Option 3: Behind Backend Proxy
 
-### Spacing
-- 8px base unit system
-- Consistent padding and margins
+Configure your backend (Node.js/Express) to serve the built frontend:
 
-### Transitions
-- Fast: 200ms (hover effects)
-- Medium: 300ms (page transitions)
-- Smooth ease-in-out timing
+```javascript
+// In backend server.js
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-### Typography
-- Sans-serif font stack
-- Bold headings with increased letter spacing
-- Line height: 150% for body, 120% for headings
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-## Browser Support
+// Serve frontend build in production
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(__dirname, '../frontend/dist')));
+  
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+  });
+}
+```
 
-Modern browsers with ES2020+ support:
-- Chrome/Edge (latest)
-- Firefox (latest)
-- Safari (latest)
+## Troubleshooting
 
-## Security Considerations
+### Dashboard not showing students
 
-- HTTPS-only API communication
-- Bearer token authentication
-- Secure WebSocket (WSS) connections
-- Protected routes with authentication checks
-- Automatic token validation and logout
+1. Check backend is running: `curl http://localhost:8000/api/health`
+2. Check `.env` file has correct `VITE_API_BASE`
+3. Check browser console for errors
 
-## Performance Optimizations
+### API requests failing
 
-- Virtualized student lists for large datasets
-- Debounced search inputs
-- Memoized components to prevent unnecessary re-renders
-- Efficient WebSocket event handling
-- Code splitting with React lazy loading potential
+1. Ensure backend is on port 8000
+2. Check CORS settings in backend
+3. Use Vite proxy (already configured in `vite.config.js`)
 
-## Accessibility
+### Build errors
 
-- WCAG AA compliant color contrast
-- Keyboard navigation support
-- ARIA labels for interactive elements
-- Focus indicators for all focusable elements
-- Semantic HTML structure
+```bash
+# Clear node_modules and reinstall
+rm -rf node_modules package-lock.json
+npm install
+```
 
 ## License
 
-Proprietary - College Lab Monitoring System
+MIT

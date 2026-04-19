@@ -14,7 +14,8 @@ async function cleanup() {
         { table: 'live_processes', col: 'updated_at' },
         { table: 'connected_devices', col: 'connected_at' },
         { table: 'network_info', col: 'updated_at' },
-        { table: 'process_history', col: 'recorded_at' },
+        { table: 'terminal_events', col: 'detected_at' },
+        { table: 'browser_history', col: 'last_visited' },
     ];
 
     for (const { table, col } of tables) {
@@ -23,11 +24,11 @@ async function cleanup() {
         console.log(`[Cleanup] ${table}: deleted ${result.rowCount} rows`);
     }
 
-    // Clean up ended sessions older than retention
+    // Clean up ended exam sessions older than retention
     const endedResult = await client.query(
-        `DELETE FROM sessions WHERE is_live = false AND end_time < ${cutoff}`
+        `DELETE FROM exam_sessions WHERE end_time IS NOT NULL AND end_time < EXTRACT(EPOCH FROM ${cutoff})`
     );
-    console.log(`[Cleanup] sessions (ended): deleted ${endedResult.rowCount} rows`);
+    console.log(`[Cleanup] exam_sessions (ended): deleted ${endedResult.rowCount} rows`);
 
     await client.end();
     console.log('[Cleanup] Done.');

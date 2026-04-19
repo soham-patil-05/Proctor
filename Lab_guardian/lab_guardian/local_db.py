@@ -213,47 +213,66 @@ class LocalDatabase:
         self.conn.commit()
     
     def insert_process_snapshot(self, session_id, processes):
-        """Append-only process logging - don't delete old data.
+        """Append-only process logging - track unique processes.
         
-        Only inserts new processes that haven't been seen before.
-        No resource consumption stats (CPU/memory) - just process names and risk.
+        Each unique process name + incognito combination is logged only once.
+        Chrome and Chrome Incognito are treated as SEPARATE processes.
+        Firefox and Firefox Private are treated as SEPARATE processes.
         """
         timestamp = datetime.now(timezone.utc).timestamp()
         cursor = self.conn.cursor()
         
-        # Group processes by name to handle duplicates in single snapshot
+        # Group processes by (name, is_incognito) to treat them as separate
         grouped = {}
         for proc in processes:
             name = proc.get('name', 'Unknown')
-            if name not in grouped:
-                grouped[name] = {
+            is_incognito = proc.get('is_incognito', False)
+            
+            # Create unique key: process_name + incognito status
+            key = f"{name}|incognito={is_incognito}"
+            
+            if key not in grouped:
+                grouped[key] = {
                     'pid': proc.get('pid'),
+                    'name': name,
                     'risk_level': 'normal',
                     'category': proc.get('category'),
                     'label': proc.get('label'),
-                    'is_incognito': proc.get('is_incognito', False),
+                    'is_incognito': is_incognito,
                     'count': 0
                 }
-            g = grouped[name]
+            g = grouped[key]
             g['count'] += 1
             # Keep highest risk
             if proc.get('risk_level') == 'high' or g['risk_level'] == 'high':
                 g['risk_level'] = 'high'
             elif proc.get('risk_level') == 'medium':
                 g['risk_level'] = 'medium'
-            # Track if any instance is incognito
-            if proc.get('is_incognito'):
-                g['is_incognito'] = True
         
         # Insert only new processes (append-only)
-        for name, data in grouped.items():
-            process_name = f"{name} (x{data['count']})" if data['count'] > 1 else name
+        for key, data in grouped.items():
+            # Build display name: include incognito indicator if applicable
+            if data['is_incognito']:
+                # Determine browser-specific private mode name
+                name_lower = data['name'].lower()
+                if 'firefox' in name_lower:
+                    process_name = f"{data['name']} 🔒 (Private Window)"
+                elif any(x in name_lower for x in ['chrome', 'chromium', 'edge', 'brave', 'opera', 'vivaldi']):
+                    process_name = f"{data['name']} 🔒 (Incognito)"
+                else:
+                    process_name = f"{data['name']} 🔒 (Private/Incognito)"
+            else:
+                process_name = data['name']
             
-            # Check if this process name already exists for this session
+            # Add count if multiple instances
+            if data['count'] > 1:
+                process_name = f"{process_name} (x{data['count']})"
+            
+            # Check if this exact process (with incognito status) already exists
             cursor.execute("""
                 SELECT id FROM local_processes 
-                WHERE session_id = ? AND process_name = ?
-            """, (session_id, process_name))
+                WHERE session_id = ? AND process_name = ? AND is_incognito = ?
+            """, (session_id, process_name, 1 if data['is_incognito'] else 0))
             
             if cursor.fetchone():
                 continue  # Skip if already logged

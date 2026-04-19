@@ -281,6 +281,8 @@ def _check_incognito(proc) -> bool:
 def _classify_process(proc_info: dict, proc_obj=None) -> dict | None:
     """Classify a process and enrich with risk_level, category, label.
     
+    Incognito/private processes are given HIGH risk and labeled appropriately.
+    Normal and incognito versions of same browser are treated as different processes.
 
     Returns None if the process should be filtered out (safe / low priority).
     Returns the enriched dict otherwise.
@@ -295,7 +297,11 @@ def _classify_process(proc_info: dict, proc_obj=None) -> dict | None:
     if is_incognito:
         proc_info["risk_level"] = "high"
         proc_info["category"] = "incognito"
-        proc_info["label"] = f"{proc_info.get('name', 'Browser')} (Incognito/Private Mode)"
+        # Create browser-specific label
+        if 'firefox' in name_lower:
+            proc_info["label"] = f"{proc_info.get('name', 'Browser')} (Private Window)"
+        else:
+            proc_info["label"] = f"{proc_info.get('name', 'Browser')} (Incognito)"
         proc_info["is_incognito"] = True
         return proc_info
 
@@ -308,12 +314,14 @@ def _classify_process(proc_info: dict, proc_obj=None) -> dict | None:
         proc_info["category"] = "dangerous"
         # Use the actual process name from PROCESS_LABELS or fallback to the name
         proc_info["label"] = PROCESS_LABELS.get(name_lower, proc_info.get("name", "Unknown Process"))
+        proc_info["is_incognito"] = False
         return proc_info
 
     if name_lower in SUSPICIOUS_PROCESSES:
         proc_info["risk_level"] = "medium"
         proc_info["category"] = "suspicious"
         proc_info["label"] = PROCESS_LABELS.get(name_lower, proc_info.get("name", "Unknown Process"))
+        proc_info["is_incognito"] = False
         return proc_info
 
     # Unknown binary — include only if CPU > threshold
@@ -322,6 +330,7 @@ def _classify_process(proc_info: dict, proc_obj=None) -> dict | None:
         proc_info["risk_level"] = "low"
         proc_info["category"] = "unknown"
         proc_info["label"] = proc_info.get("name", "Unknown Process")
+        proc_info["is_incognito"] = False
         return proc_info
 
     # Low CPU unknown process → skip

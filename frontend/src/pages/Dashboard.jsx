@@ -1,132 +1,167 @@
-import { useState, useEffect } from 'react';
-import { BookOpen, Activity, List } from 'lucide-react';
-import { api } from '../services/api';
-import Card from '../components/ui/Card';
-import Sidebar from '../components/layout/Sidebar';
-import Topbar from '../components/layout/Topbar';
-import { useSession } from '../context/SessionContext';
+import { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { fetchDashboardStudents, endAllSessions } from '../services/api';
+import EndSessionModal from '../components/EndSessionModal';
 
-export default function Dashboard() {
-  const [stats, setStats] = useState({
-    totalSubjects: 0,
-    totalSessions: 0,
-  });
+const REFRESH_INTERVAL = 5000; // 5 seconds
+
+function Dashboard() {
+  const navigate = useNavigate();
+  const [students, setStudents] = useState([]);
+  const [groupedStudents, setGroupedStudents] = useState([]);
   const [loading, setLoading] = useState(true);
-  const teacherName = localStorage.getItem('teacherName') || 'Professor';
-  const { liveSession } = useSession();
+  const [error, setError] = useState(null);
+  const [filters, setFilters] = useState({
+    lab_no: '',
+    time_from: '',
+    time_to: '',
+  });
+  const [showEndModal, setShowEndModal] = useState(false);
 
-  useEffect(() => {
-    loadStats();
-  }, []);
-
-  const loadStats = async () => {
+  const loadStudents = useCallback(async () => {
     try {
-      const [subjects, sessions] = await Promise.all([
-        api.subjects.getAll(),
-        api.sessions.getAll('all'),
-      ]);
-
-      setStats({
-        totalSubjects: subjects.length,
-        totalSessions: sessions.length,
-      });
-    } catch (error) {
-      console.error('Error loading stats:', error);
+      setLoading(true);
+      const data = await fetchDashboardStudents(filters);
+      setStudents(data);
+      setGroupedStudents(data.grouped || []);
+      setError(null);
+    } catch (err) {
+      setError(err.message);
     } finally {
       setLoading(false);
     }
+  }, [filters]);
+
+  useEffect(() => {
+    loadStudents();
+    const interval = setInterval(loadStudents, REFRESH_INTERVAL);
+    return () => clearInterval(interval);
+  }, [loadStudents]);
+
+  const handleFilterChange = (key, value) => {
+    setFilters(prev => ({ ...prev, [key]: value }));
   };
 
-  const statCards = [
-    {
-      title: 'Total Subjects',
-      value: stats.totalSubjects,
-      icon: BookOpen,
-      color: 'var(--color-accent)',
-    },
-    {
-      title: 'Active Session',
-      value: liveSession ? '1' : '0',
-      icon: Activity,
-      color: 'var(--color-success)',
-    },
-    {
-      title: 'Total Sessions',
-      value: stats.totalSessions,
-      icon: List,
-      color: 'var(--color-primary)',
-    },
-  ];
+  const handleEndSessions = async (secretKey) => {
+    try {
+      await endAllSessions(secretKey);
+      setShowEndModal(false);
+      alert('All sessions ended successfully!');
+      loadStudents(); // Refresh the list
+    } catch (err) {
+      alert(err.message);
+      throw err; // Re-throw to keep modal open
+    }
+  };
+
+  const formatTime = (timestamp) => {
+    if (!timestamp) return 'N/A';
+    const date = new Date(timestamp * 1000);
+    return date.toLocaleTimeString();
+  };
+
+  const formatDate = (timestamp) => {
+    if (!timestamp) return 'N/A';
+    const date = new Date(timestamp * 1000);
+    return date.toLocaleString();
+  };
+
+  if (loading && groupedStudents.length === 0) {
+    return <div className="loading">Loading students...</div>;
+  }
 
   return (
-    <div className="min-h-screen bg-[var(--color-gray-50)]">
-      <Sidebar />
-      <div className="ml-64">
-        <Topbar teacherName={teacherName} />
-        <main className={`p-8 ${liveSession ? 'mt-28' : 'mt-16'}`}>
-          <div className="max-w-7xl mx-auto">
-            <h1 className="text-3xl font-bold text-[var(--color-gray-900)] mb-8 tracking-wide">
-              Dashboard
-            </h1>
+    <div>
+      <div className="dashboard-header">
+        <h2>Active Exam Sessions</h2>
+        <div className="filters">
+          <select
+            className="filter-select"
+            value={filters.lab_no}
+            onChange={(e) => handleFilterChange('lab_no', e.target.value)}
+          >
+            <option value="">All Labs</option>
+            {Array.from({ length: 12 }, (_, i) => `L${(i + 1).toString().padStart(2, '0')}`).map(lab => (
+              <option key={lab} value={lab}>{lab}</option>
+            ))}
+          </select>
+          
+          <input
+            type="datetime-local"
+            className="filter-input"
+            value={filters.time_from}
+            onChange={(e) => handleFilterChange('time_from', e.target.value)}
+            placeholder="From"
+          />
+          
+          <input
+            type="datetime-local"
+            className="filter-input"
+            value={filters.time_to}
+            onChange={(e) => handleFilterChange('time_to', e.target.value)}
+            placeholder="To"
+          />
+          
+          <button className="btn-danger" onClick={() => setShowEndModal(true)}>
+            End All Sessions
+          </button>
+        </div>
+      </div>
 
-            {loading ? (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                {[1, 2, 3].map((i) => (
-                  <Card key={i} className="p-6 animate-pulse">
-                    <div className="h-4 bg-[var(--color-gray-200)] rounded w-1/2 mb-4"></div>
-                    <div className="h-8 bg-[var(--color-gray-200)] rounded w-1/3"></div>
-                  </Card>
+      {error && (
+        <div style={{ background: '#fee', padding: '1rem', borderRadius: '0.375rem', marginBottom: '1rem', color: '#c00' }}>
+          Error: {error}
+        </div>
+      )}
+
+      {groupedStudents.length === 0 ? (
+        <div className="empty-state">
+          <h3>No Active Sessions</h3>
+          <p>Students will appear here when they start their exams.</p>
+        </div>
+      ) : (
+        <div className="student-groups">
+          {groupedStudents.map((group, index) => (
+            <div key={index} className="student-group">
+              <div className="group-header">
+                Started at {formatDate(group.start_time)} ({group.students.length} student{group.students.length !== 1 ? 's' : ''})
+              </div>
+              <div className="student-list">
+                {group.students.map((student) => (
+                  <div
+                    key={student.session_id}
+                    className="student-card"
+                    onClick={() => navigate(`/student/${student.session_id}`)}
+                  >
+                    <div className="student-info">
+                      <h3>{student.roll_no}</h3>
+                      <div className="student-meta">
+                        <span>📍 Lab: {student.lab_no}</span>
+                        <span>🕐 Started: {formatTime(student.start_time)}</span>
+                      </div>
+                    </div>
+                    <div className="student-stats">
+                      <span className="stat-badge">💻 {student.process_count || 0} processes</span>
+                      <span className="stat-badge">🔌 {student.device_count || 0} devices</span>
+                      <span className="stat-badge">💻 {student.terminal_event_count || 0} terminal</span>
+                      <span className="stat-badge">🌐 {student.browser_history_count || 0} URLs</span>
+                    </div>
+                  </div>
                 ))}
               </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                {statCards.map((stat, index) => {
-                  const Icon = stat.icon;
-                  return (
-                    <Card
-                      key={index}
-                      className="p-6 fade-in"
-                      style={{ animationDelay: `${index * 100}ms` }}
-                    >
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <p className="text-sm font-medium text-[var(--color-gray-600)] mb-2">
-                            {stat.title}
-                          </p>
-                          <p className="text-4xl font-bold text-[var(--color-gray-900)]">
-                            {stat.value}
-                          </p>
-                        </div>
-                        <div
-                          className="w-14 h-14 rounded-xl flex items-center justify-center"
-                          style={{ backgroundColor: `${stat.color}20` }}
-                        >
-                          <Icon
-                            className="h-7 w-7"
-                            style={{ color: stat.color }}
-                          />
-                        </div>
-                      </div>
-                    </Card>
-                  );
-                })}
-              </div>
-            )}
-
-            <div className="mt-12">
-              <Card className="p-8">
-                <h2 className="text-xl font-bold text-[var(--color-gray-900)] mb-4">
-                  Welcome to Lab Monitoring System
-                </h2>
-                <p className="text-[var(--color-gray-600)] leading-relaxed">
-                  Monitor and manage your lab sessions effectively. Create new sessions,
-                  track student activities, and view real-time process information.
-                </p>
-              </Card>
             </div>
-          </div>
-        </main>
-      </div>
+          ))}
+        </div>
+      )}
+
+      {showEndModal && (
+        <EndSessionModal
+          onClose={() => setShowEndModal(false)}
+          onConfirm={handleEndSessions}
+        />
+      )}
     </div>
   );
 }
+
+export default Dashboard;
