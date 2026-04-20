@@ -115,6 +115,12 @@ class LabGuardianGUI:
 
         self.start_status_var = tk.StringVar(value="")
         self.status_bar_var = tk.StringVar(value="Ready")
+        self.displayed_rowids = {
+            "devices": set(),
+            "browserHistory": set(),
+            "processes": set(),
+            "terminalEvents": set(),
+        }
 
         self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -270,20 +276,10 @@ class LabGuardianGUI:
 
         # Processes tab
         self.processes_empty_var = tk.StringVar(value="")
-        high_frame = ttk.LabelFrame(processes_tab, text="⚠ High Risk Processes", padding=6)
-        high_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
-        self.high_process_tree = self._tree_with_scroll(
-            high_frame,
-            ("display_name", "pids", "cpu", "memory", "instances"),
-            ("Process Name", "PIDs", "CPU %", "Memory (MB)", "Instances"),
-        )
-
-        medium_frame = ttk.LabelFrame(processes_tab, text="Suspicious Processes", padding=6)
-        medium_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
-        self.medium_process_tree = self._tree_with_scroll(
-            medium_frame,
-            ("display_name", "pids", "cpu", "memory", "instances"),
-            ("Process Name", "PIDs", "CPU %", "Memory (MB)", "Instances"),
+        self.process_tree = self._tree_with_scroll(
+            processes_tab,
+            ("process_name", "pid", "cpu", "memory", "risk_level", "category"),
+            ("Process Name", "PID", "CPU %", "Memory (MB)", "Risk", "Category"),
         )
         tk.Label(processes_tab, textvariable=self.processes_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(0, 8))
 
@@ -291,8 +287,8 @@ class LabGuardianGUI:
         self.terminal_empty_var = tk.StringVar(value="")
         self.terminal_tree = self._tree_with_scroll(
             terminal_tab,
-            ("tool", "detected_at", "pid", "content", "source", "message", "risk_level"),
-            ("Tool", "Time", "PID", "Command / Connection", "Source", "Message", "Risk"),
+            ("detected_at", "event_type", "tool", "full_command", "remote_ip", "risk_level"),
+            ("Time", "Event Type", "Tool", "Command", "Remote IP", "Risk"),
         )
         tk.Label(terminal_tab, textvariable=self.terminal_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(4, 8))
 
@@ -344,6 +340,7 @@ class LabGuardianGUI:
             "sessionId": session_id,
             "labNo": lab_no,
         }
+        self._reset_display_cache()
         self.header_left_var.set(f"{name} | {roll_no}")
 
         self.show_session()
@@ -358,7 +355,24 @@ class LabGuardianGUI:
         self.runtime.stop()
         db.end_session(self.active_session["sessionId"], self.active_session["rollNo"])
         self.active_session = None
+        self._reset_display_cache()
         self.show_start()
+
+    def _reset_display_cache(self):
+        self.displayed_rowids = {
+            "devices": set(),
+            "browserHistory": set(),
+            "processes": set(),
+            "terminalEvents": set(),
+        }
+        for tree in [
+            getattr(self, "device_tree", None),
+            getattr(self, "network_tree", None),
+            getattr(self, "process_tree", None),
+            getattr(self, "terminal_tree", None),
+        ]:
+            if tree is not None:
+                self._clear_tree(tree)
 
     def _probe_backend(self):
         host = config.BACKEND_HOST
@@ -399,7 +413,7 @@ class LabGuardianGUI:
                 self.root.after(0, lambda: self._export_done(False, "Backend server is not reachable. Try again later."))
                 return
 
-            unsynced_data, _row_ids = db.get_unsynced(session_id, roll_no)
+            unsynced_data = db.get_unsynced(session_id, roll_no)
             if self._record_count(unsynced_data) == 0:
                 self.root.after(0, lambda: self._export_done(False, "No unsynced records found."))
                 return
@@ -512,28 +526,6 @@ class LabGuardianGUI:
         except Exception:
             return url
 
-    def _group_processes(self, processes: list[dict]) -> list[dict]:
-        grouped = {}
-        for row in processes:
-            name = (row.get("label") or row.get("name") or "Unknown Process").strip()
-            bucket = grouped.setdefault(
-                name,
-                {
-                    "display_name": name,
-                    "pids": [],
-                    "total_cpu": 0.0,
-                    "total_memory": 0.0,
-                    "count": 0,
-                    "risk_level": (row.get("risk_level") or "normal").lower(),
-                },
-            )
-            if row.get("pid") is not None:
-                bucket["pids"].append(int(row.get("pid")))
-            bucket["total_cpu"] += float(row.get("cpu") or 0.0)
-            bucket["total_memory"] += float(row.get("memory") or 0.0)
-            bucket["count"] += 1
-        return list(grouped.values())
-
     def refresh_session_view(self):
         if not self.active_session:
             return
@@ -542,8 +534,11 @@ class LabGuardianGUI:
 
         # Devices
         devices = payload.get("devices", [])
-        self._clear_tree(self.device_tree)
         for row in devices:
+            row_id = row.get("_rowid")
+            if row_id in self.displayed_rowids["devices"]:
+                continue
+            self.displayed_rowids["devices"].add(row_id)
             metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
             self.device_tree.insert(
                 "",
@@ -557,16 +552,19 @@ class LabGuardianGUI:
                 ),
                 tags=(self._risk_tag(row.get("risk_level")),),
             )
-        self.devices_empty_var.set("No USB devices connected." if not devices else "")
+        self.devices_empty_var.set("No USB devices connected." if len(self.device_tree.get_children()) == 0 else "")
 
         # Network (Browser History)
         browser_history = sorted(
             payload.get("browserHistory", []),
             key=lambda item: float(item.get("last_visited") or 0),
-            reverse=True,
+            reverse=False,
         )
-        self._clear_tree(self.network_tree)
         for row in browser_history:
+            row_id = row.get("_rowid")
+            if row_id in self.displayed_rowids["browserHistory"]:
+                continue
+            self.displayed_rowids["browserHistory"].add(row_id)
             title = row.get("title") or self._title_fallback(row.get("url") or "")
             self.network_tree.insert(
                 "",
@@ -579,99 +577,82 @@ class LabGuardianGUI:
                     int(row.get("visit_count") or 1),
                 ),
             )
-        self.network_empty_var.set("No browsing activity since session started." if not browser_history else "")
+        self.network_empty_var.set("No browsing activity since session started." if len(self.network_tree.get_children()) == 0 else "")
 
         # Processes
         process_rows = [
             row
             for row in payload.get("processes", [])
             if str(row.get("status") or "").lower() != "ended"
-            and str(row.get("risk_level") or "").lower() in {"high", "medium"}
+            and str(row.get("risk_level") or "").lower() != "safe"
         ]
+        risk_order = {"high": 0, "medium": 1, "low": 2, "normal": 3}
+        process_rows.sort(
+            key=lambda row: (
+                risk_order.get(str(row.get("risk_level") or "normal").lower(), 4),
+                str(row.get("detected_at") or ""),
+                int(row.get("_rowid") or 0),
+            )
+        )
 
-        high_groups = self._group_processes([r for r in process_rows if str(r.get("risk_level") or "").lower() == "high"])
-        medium_groups = self._group_processes([r for r in process_rows if str(r.get("risk_level") or "").lower() == "medium"])
-
-        self._clear_tree(self.high_process_tree)
-        for row in high_groups:
-            pids = ", ".join(str(pid) for pid in sorted(row.get("pids", [])))
-            self.high_process_tree.insert(
+        for row in process_rows:
+            row_id = row.get("_rowid")
+            if row_id in self.displayed_rowids["processes"]:
+                continue
+            self.displayed_rowids["processes"].add(row_id)
+            display_name = row.get("label") or row.get("name") or "Unknown Process"
+            self.process_tree.insert(
                 "",
                 tk.END,
                 values=(
-                    row.get("display_name"),
-                    pids,
-                    f"{row.get('total_cpu', 0.0):.1f}",
-                    f"{row.get('total_memory', 0.0):.1f}",
-                    row.get("count") if row.get("count", 0) > 1 else "",
+                    display_name,
+                    row.get("pid") if row.get("pid") is not None else "—",
+                    f"{float(row.get('cpu') or 0.0):.1f}",
+                    f"{float(row.get('memory') or 0.0):.1f}",
+                    str(row.get("risk_level") or "normal").lower(),
+                    row.get("category") or "—",
                 ),
-                tags=("high",),
+                tags=(self._risk_tag(row.get("risk_level")),),
             )
 
-        self._clear_tree(self.medium_process_tree)
-        for row in medium_groups:
-            pids = ", ".join(str(pid) for pid in sorted(row.get("pids", [])))
-            self.medium_process_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    row.get("display_name"),
-                    pids,
-                    f"{row.get('total_cpu', 0.0):.1f}",
-                    f"{row.get('total_memory', 0.0):.1f}",
-                    row.get("count") if row.get("count", 0) > 1 else "",
-                ),
-                tags=("medium",),
-            )
-
-        if not high_groups and not medium_groups:
-            self.processes_empty_var.set("No notable processes detected.")
-        else:
-            self.processes_empty_var.set("")
+        self.processes_empty_var.set("No notable processes detected." if len(self.process_tree.get_children()) == 0 else "")
 
         # Terminal
         terminal_rows = sorted(
             payload.get("terminalEvents", []),
             key=lambda item: str(item.get("detected_at") or ""),
-            reverse=True,
+            reverse=False,
         )
-        self._clear_tree(self.terminal_tree)
-
         for row in terminal_rows:
-            event_type = str(row.get("event_type") or "")
-            if event_type == "terminal_command":
-                content = row.get("full_command") or "—"
-                source = "Auditd"
-            else:
+            row_id = row.get("_rowid")
+            if row_id in self.displayed_rowids["terminalEvents"]:
+                continue
+            self.displayed_rowids["terminalEvents"].add(row_id)
+
+            full_command = row.get("full_command") or "—"
+            if full_command == "—" and str(row.get("event_type") or "") == "terminal_request":
                 ip = row.get("remote_ip") or ""
                 port = row.get("remote_port") or ""
-                host = row.get("remote_host") or ""
-                parts = []
                 if ip and port:
-                    parts.append(f"{ip}:{port}")
+                    full_command = f"{ip}:{port}"
                 elif ip:
-                    parts.append(str(ip))
-                if host:
-                    parts.append(f"({host})")
-                content = " ".join(parts) if parts else "—"
-                source = "SS"
+                    full_command = ip
 
             self.terminal_tree.insert(
                 "",
                 tk.END,
                 values=(
-                    row.get("tool") or "unknown",
                     self._safe_time_from_iso(row.get("detected_at")),
-                    row.get("pid") if row.get("pid") is not None else "—",
-                    content,
-                    source,
-                    row.get("message") or "—",
+                    row.get("event_type") or "—",
+                    row.get("tool") or "unknown",
+                    full_command,
+                    row.get("remote_ip") or "—",
                     (row.get("risk_level") or "normal").lower(),
                 ),
                 tags=(self._risk_tag(row.get("risk_level")),),
             )
 
-        self.terminal_empty_var.set("No terminal activity recorded." if not terminal_rows else "")
+        self.terminal_empty_var.set("No terminal activity recorded." if len(self.terminal_tree.get_children()) == 0 else "")
 
         self.status_bar_var.set(
             f"Last updated: {datetime.now().strftime('%H:%M:%S')} | Devices: {len(devices)} | "

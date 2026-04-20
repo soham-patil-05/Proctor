@@ -45,6 +45,7 @@ def _normalize_process(process: dict) -> dict:
         "memory": memory,
         "status": process.get("status") or "running",
         "risk_level": process.get("risk_level"),
+        "category": process.get("category"),
     }
 
 
@@ -198,7 +199,7 @@ async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[a
                 if meta.get("message") is not None and merged.get("message") is None:
                     merged["message"] = meta.get("message")
                 normalized = _normalize_terminal(merged, event_type, ts)
-                db.insert_terminal_event(session_id, roll_no, normalized)
+                db.save_terminal_event(session_id, roll_no, normalized)
 
             elif event_type == "terminal_events_snapshot" and isinstance(data, list):
                 events = []
