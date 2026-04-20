@@ -13,7 +13,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "lab_guardian=lab_guardian.cli:main",
+            "lab_guardian=lab_guardian.gui:main",
         ],
     },
     classifiers=[

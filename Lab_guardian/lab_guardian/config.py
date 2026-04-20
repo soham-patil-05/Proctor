@@ -1,10 +1,18 @@
-"""Configuration defaults — overridden by env vars or CLI args."""
+"""Configuration defaults — overridden by env vars.
+
+LAB_LIST is duplicated in frontend constants and must remain identical.
+"""
 
 import os
 
-# Backend server URLs
+# Backend server URL
 API_BASE_URL = os.environ.get("LAB_GUARDIAN_API_URL", "http://localhost:8000")
-WS_BASE_URL = os.environ.get("LAB_GUARDIAN_WS_URL", "ws://localhost:8001")
+
+# Shared lab identifiers. Keep identical to frontend/src/constants/labs.js
+LAB_LIST = [
+	"L01", "L02", "L03", "L04", "L05",
+	"L06", "L07", "L08", "L09", "L10",
+]
 
 # Monitor intervals (seconds)
 SNAPSHOT_INTERVAL = int(os.environ.get("LG_SNAPSHOT_INTERVAL", "30"))

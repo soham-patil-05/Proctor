@@ -4,7 +4,6 @@ import http from 'node:http';
 import app from './app.js';
 import { config } from './config/index.js';
 import { pool } from './db/index.js';
-import { startWsServer, stopWsServer } from './ws-server.js';
 
 /**
  * In production, terminate TLS at the reverse-proxy (nginx / Caddy / AWS ALB).
@@ -17,13 +16,10 @@ server.listen(config.port, () => {
     console.log(`[HTTP] Listening on port ${config.port}`);
 });
 
-await startWsServer();
-
 /* ─── Graceful shutdown ─────────────────────────────────────────── */
 async function shutdown(signal) {
     console.log(`\n[${signal}] Shutting down…`);
     server.close();
-    await stopWsServer();
     await pool.end();
     process.exit(0);
 }

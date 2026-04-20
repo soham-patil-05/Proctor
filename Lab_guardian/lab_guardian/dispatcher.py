@@ -1,16 +1,24 @@
-"""dispatcher.py — Orchestrate all monitors and funnel events to WS client."""
+"""dispatcher.py — Orchestrate monitors and persist events to local SQLite."""
 
 import asyncio
 import logging
+from typing import Optional
 
-from . import ws_client
+from . import db
 from .monitor import process_monitor, device_monitor, network_monitor, browser_history
 
 log = logging.getLogger("lab_guardian.dispatcher")
 
 
-async def run(session_id: str, student_id: str, token: str):
-    """Start all monitors + WS connection; blocks until session ends or Ctrl-C."""
+async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[asyncio.Event] = None):
+    """Start all monitors and persist event stream to local DB.
+
+    The monitor orchestration and queue fan-in behavior are intentionally
+    preserved from the previous dispatcher implementation.
+    """
+
+    if stop_event is None:
+        stop_event = asyncio.Event()
 
     # Keep a local queue so monitors never block on the network
     _queue: asyncio.Queue = asyncio.Queue(maxsize=4096)
@@ -25,10 +33,10 @@ async def run(session_id: str, student_id: str, token: str):
         await _queue.put(event)
 
     async def drain():
-        """Forward events from local queue → ws_client.send()."""
+        """Forward events from local queue -> db.insert_event()."""
         while True:
             evt = await _queue.get()
-            await ws_client.send(evt)
+            db.insert_event(session_id, roll_no, lab_no, evt)
 
     async def browser_history_monitor(send_fn):
         """Monitor browser history for visited URLs."""
@@ -42,7 +50,7 @@ async def run(session_id: str, student_id: str, token: str):
             try:
                 new_urls = browser_history.get_new_history()
                 if new_urls:
-                    log.info(f"Sending {len(new_urls)} browser history URLs to server")
+                    log.info("Persisting %d browser history URLs", len(new_urls))
                     # Send as browser_history event
                     await send_fn({
                         "type": "browser_history",
@@ -62,14 +70,17 @@ async def run(session_id: str, student_id: str, token: str):
             # Scan every 10 seconds
             await asyncio.sleep(10)
 
+    async def stop_waiter():
+        await stop_event.wait()
+
     # Launch all concurrently
     tasks = [
-        asyncio.create_task(ws_client.start(session_id, student_id, token), name="ws"),
         asyncio.create_task(process_monitor.run(enqueue), name="proc"),
         asyncio.create_task(device_monitor.run(enqueue), name="dev"),
         asyncio.create_task(network_monitor.run(enqueue), name="net"),
         asyncio.create_task(browser_history_monitor(enqueue), name="browser"),
         asyncio.create_task(drain(), name="drain"),
+        asyncio.create_task(stop_waiter(), name="stop"),
     ]
 
     try:
