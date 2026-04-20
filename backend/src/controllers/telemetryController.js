@@ -1,6 +1,5 @@
 import { v5 as uuidv5, validate as uuidValidate } from 'uuid';
 import { query } from '../db/index.js';
-import { toCamel } from '../utils/helpers.js';
 
 const SESSION_NAMESPACE = '2ffce69a-b3c9-4d84-a6f7-a67dd6a958cc';
 
@@ -10,21 +9,26 @@ function normalizeSessionId(sessionId) {
   return uuidValidate(s) ? s : uuidv5(s, SESSION_NAMESPACE);
 }
 
-function toIsoOrNull(value) {
-  if (!value) return null;
+function toIsoOrNow(value) {
+  if (!value) return new Date().toISOString();
   const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
 }
 
-function parseMaybeJsonArray(value) {
-  if (Array.isArray(value)) return value;
-  if (typeof value !== 'string') return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+function toFloat(value, fallback = null) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function toInt(value, fallback = null) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+function normalizeRisk(value) {
+  const risk = String(value || 'normal').toLowerCase();
+  if (['high', 'medium', 'low', 'normal'].includes(risk)) return risk;
+  return 'normal';
 }
 
 async function ensureTeacherAndSubject() {
@@ -84,255 +88,138 @@ async function ensureSessionStudent(sessionId, studentId) {
   );
 }
 
-/**
- * EXPORT_PAYLOAD_SCHEMA:
- * {
- *   "sessionId": string,
- *   "rollNo": string,
- *   "labNo": string,
- *   "name": string,
- *   "processes": [ { pid, process_name, cpu_percent, memory_mb, status, risk_level, category } ],
- *   "devices": [ { device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message } ],
- *   "network": { ip_address, gateway, dns, active_connections: [...] },
- *   "domainActivity": [ { domain, request_count, risk_level, last_accessed } ],
- *   "terminalEvents": [ { event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at } ],
- *   "browserHistory": [ { url, title, visit_count, last_visit } ]
- * }
- */
 export async function ingestTelemetry(req, res) {
   const {
     sessionId,
     rollNo,
     labNo,
     name,
-    processes = [],
     devices = [],
-    network = null,
-    domainActivity = [],
-    terminalEvents = [],
     browserHistory = [],
+    processes = [],
+    terminalEvents = [],
   } = req.body || {};
 
   if (!sessionId || !rollNo) {
     return res.status(400).json({ error: 'sessionId and rollNo are required' });
   }
 
-  const stored = {
-    processes: 0,
-    devices: 0,
-    network: 0,
-    domainActivity: 0,
-    terminalEvents: 0,
-    browserHistory: 0,
-  };
-  const errors = [];
-
   try {
     const resolvedSessionId = await ensureSession(sessionId, labNo);
     const studentId = await ensureStudent(rollNo, name);
     await ensureSessionStudent(resolvedSessionId, studentId);
 
-    try {
-      if (Array.isArray(processes)) {
+    if (Array.isArray(devices)) {
+      for (const device of devices) {
+        const metadata = device?.metadata;
+        const metadataJson =
+          typeof metadata === 'string' ? metadata : JSON.stringify(metadata && typeof metadata === 'object' ? metadata : {});
+
         await query(
-          `UPDATE live_processes
-           SET status = 'ended', updated_at = now()
-           WHERE session_id = $1 AND student_id = $2`,
-          [resolvedSessionId, studentId]
-        );
-
-        for (const p of processes) {
-          await query(
-            `INSERT INTO live_processes
-             (session_id, student_id, pid, process_name, cpu_percent, memory_mb, status, risk_level, category, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
-             ON CONFLICT (session_id, student_id, pid)
-             DO UPDATE SET
-               process_name = EXCLUDED.process_name,
-               cpu_percent = EXCLUDED.cpu_percent,
-               memory_mb = EXCLUDED.memory_mb,
-               status = EXCLUDED.status,
-               risk_level = EXCLUDED.risk_level,
-               category = EXCLUDED.category,
-               updated_at = now()`,
-            [
-              resolvedSessionId,
-              studentId,
-              p.pid,
-              p.process_name,
-              p.cpu_percent ?? 0,
-              p.memory_mb ?? 0,
-              p.status ?? 'running',
-              p.risk_level ?? null,
-              p.category ?? null,
-            ]
-          );
-          stored.processes += 1;
-        }
-      }
-    } catch (err) {
-      console.error('[ingest/processes]', err);
-      errors.push(`processes: ${err.message}`);
-    }
-
-    try {
-      if (Array.isArray(devices)) {
-        for (const d of devices) {
-          await query(
-            `INSERT INTO connected_devices
-             (session_id, student_id, device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             ON CONFLICT (session_id, student_id, device_id)
-             DO UPDATE SET
-               device_name = EXCLUDED.device_name,
-               device_type = EXCLUDED.device_type,
-               connected_at = COALESCE(EXCLUDED.connected_at, connected_devices.connected_at),
-               disconnected_at = EXCLUDED.disconnected_at,
-               readable_name = EXCLUDED.readable_name,
-               risk_level = EXCLUDED.risk_level,
-               message = EXCLUDED.message`,
-            [
-              resolvedSessionId,
-              studentId,
-              d.device_id,
-              d.device_name,
-              d.device_type,
-              toIsoOrNull(d.connected_at) ?? new Date().toISOString(),
-              toIsoOrNull(d.disconnected_at),
-              d.readable_name ?? null,
-              d.risk_level ?? null,
-              d.message ?? null,
-            ]
-          );
-          stored.devices += 1;
-        }
-      }
-    } catch (err) {
-      console.error('[ingest/devices]', err);
-      errors.push(`devices: ${err.message}`);
-    }
-
-    try {
-      if (network && typeof network === 'object') {
-        await query(
-          `INSERT INTO network_info
-           (session_id, student_id, ip_address, gateway, dns, active_connections, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, now())
-           ON CONFLICT (session_id, student_id)
+          `INSERT INTO connected_devices
+           (session_id, student_id, device_id, device_name, device_type, connected_at, readable_name, risk_level, message, metadata)
+           VALUES ($1, $2, $3, $4, 'usb', now(), $5, $6, $7, $8::jsonb)
+           ON CONFLICT (session_id, student_id, device_id)
            DO UPDATE SET
-             ip_address = EXCLUDED.ip_address,
-             gateway = EXCLUDED.gateway,
-             dns = EXCLUDED.dns,
-             active_connections = EXCLUDED.active_connections,
+             device_name = EXCLUDED.device_name,
+             device_type = 'usb',
+             readable_name = EXCLUDED.readable_name,
+             risk_level = EXCLUDED.risk_level,
+             message = EXCLUDED.message,
+             metadata = EXCLUDED.metadata`,
+          [
+            resolvedSessionId,
+            studentId,
+            device?.id ?? null,
+            device?.readable_name ?? device?.device_name ?? 'USB Storage Device',
+            device?.readable_name ?? null,
+            normalizeRisk(device?.risk_level),
+            device?.message ?? null,
+            metadataJson,
+          ]
+        );
+      }
+    }
+
+    if (Array.isArray(browserHistory)) {
+      for (const entry of browserHistory) {
+        if (!entry?.url) continue;
+        await query(
+          `INSERT INTO browser_history (session_id, roll_no, url, title, visit_count, last_visited, browser)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (session_id, roll_no, url)
+           DO UPDATE SET
+             title = COALESCE(EXCLUDED.title, browser_history.title),
+             visit_count = GREATEST(browser_history.visit_count, EXCLUDED.visit_count),
+             last_visited = GREATEST(COALESCE(browser_history.last_visited, 0), COALESCE(EXCLUDED.last_visited, 0)),
+             browser = COALESCE(EXCLUDED.browser, browser_history.browser)`,
+          [
+            String(resolvedSessionId),
+            String(rollNo),
+            entry?.url ?? null,
+            entry?.title ?? null,
+            toInt(entry?.visit_count, 1),
+            toFloat(entry?.last_visited, null),
+            entry?.browser ?? null,
+          ]
+        );
+      }
+    }
+
+    if (Array.isArray(processes)) {
+      for (const process of processes) {
+        await query(
+          `INSERT INTO live_processes
+           (session_id, student_id, pid, process_name, cpu_percent, memory_mb, status, risk_level, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+           ON CONFLICT (session_id, student_id, pid)
+           DO UPDATE SET
+             process_name = EXCLUDED.process_name,
+             cpu_percent = EXCLUDED.cpu_percent,
+             memory_mb = EXCLUDED.memory_mb,
+             status = EXCLUDED.status,
+             risk_level = EXCLUDED.risk_level,
              updated_at = now()`,
           [
             resolvedSessionId,
             studentId,
-            network.ip_address ?? null,
-            network.gateway ?? null,
-            JSON.stringify(Array.isArray(network.dns) ? network.dns : []),
-            JSON.stringify(Array.isArray(network.active_connections) ? network.active_connections : []),
+            toInt(process?.pid, null),
+            process?.label || process?.name || process?.process_name || null,
+            toFloat(process?.cpu, 0),
+            toFloat(process?.memory, 0),
+            process?.status || 'running',
+            process?.risk_level || null,
           ]
         );
-        stored.network += 1;
       }
-    } catch (err) {
-      console.error('[ingest/network]', err);
-      errors.push(`network: ${err.message}`);
     }
 
-    try {
-      if (Array.isArray(domainActivity)) {
-        for (const d of domainActivity) {
-          await query(
-            `INSERT INTO domain_activity
-             (id, session_id, student_id, domain, request_count, risk_level, last_accessed)
-             VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, $6)
-             ON CONFLICT (session_id, student_id, domain)
-             DO UPDATE SET
-               request_count = domain_activity.request_count + EXCLUDED.request_count,
-               risk_level = EXCLUDED.risk_level,
-               last_accessed = EXCLUDED.last_accessed`,
-            [
-              resolvedSessionId,
-              studentId,
-              d.domain,
-              d.request_count ?? 1,
-              d.risk_level ?? null,
-              toIsoOrNull(d.last_accessed) ?? new Date().toISOString(),
-            ]
-          );
-          stored.domainActivity += 1;
-        }
+    if (Array.isArray(terminalEvents)) {
+      for (const event of terminalEvents) {
+        await query(
+          `INSERT INTO terminal_events
+           (id, session_id, student_id, event_type, tool, detected_at, pid, full_command, remote_ip, remote_port, remote_host, message, risk_level)
+           VALUES (COALESCE($1::uuid, uuid_generate_v4()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          [
+            event?.id && uuidValidate(String(event.id)) ? event.id : null,
+            resolvedSessionId,
+            studentId,
+            event?.event_type || null,
+            event?.tool || null,
+            toIsoOrNow(event?.detected_at),
+            toInt(event?.pid, null),
+            event?.full_command ?? null,
+            event?.remote_ip ?? null,
+            event?.remote_port ?? null,
+            event?.remote_host ?? null,
+            event?.message ?? null,
+            normalizeRisk(event?.risk_level),
+          ]
+        );
       }
-    } catch (err) {
-      console.error('[ingest/domainActivity]', err);
-      errors.push(`domainActivity: ${err.message}`);
     }
 
-    try {
-      if (Array.isArray(terminalEvents)) {
-        for (const t of terminalEvents) {
-          await query(
-            `INSERT INTO terminal_events
-             (id, session_id, student_id, event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at)
-             VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-            [
-              resolvedSessionId,
-              studentId,
-              t.event_type,
-              t.tool ?? null,
-              t.remote_ip ?? null,
-              t.remote_host ?? null,
-              t.remote_port ?? null,
-              t.pid ?? null,
-              t.full_command ?? null,
-              t.risk_level ?? null,
-              t.message ?? null,
-              toIsoOrNull(t.detected_at) ?? new Date().toISOString(),
-            ]
-          );
-          stored.terminalEvents += 1;
-        }
-      }
-    } catch (err) {
-      console.error('[ingest/terminalEvents]', err);
-      errors.push(`terminalEvents: ${err.message}`);
-    }
-
-    try {
-      if (Array.isArray(browserHistory)) {
-        for (const b of browserHistory) {
-          await query(
-            `INSERT INTO browser_history
-             (session_id, student_id, url, title, visit_count, last_visit, synced, created_at, recorded_at)
-             VALUES ($1, $2, $3, $4, $5, $6, true, now(), now())`,
-            [
-              resolvedSessionId,
-              studentId,
-              b.url ?? null,
-              b.title ?? null,
-              b.visit_count ?? 1,
-              toIsoOrNull(b.last_visit) ?? new Date().toISOString(),
-            ]
-          );
-          stored.browserHistory += 1;
-        }
-      }
-    } catch (err) {
-      console.error('[ingest/browserHistory]', err);
-      errors.push(`browserHistory: ${err.message}`);
-    }
-
-    if (errors.length > 0) {
-      return res.status(500).json({
-        error: 'Storage failure',
-        detail: errors.join(' | '),
-        stored,
-      });
-    }
-
-    return res.json({ success: true, stored });
+    return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ error: 'Storage failure', detail: err.message });
   }
@@ -356,8 +243,6 @@ export async function queryTelemetry(req, res, next) {
               GREATEST(
                 COALESCE(MAX(lp.updated_at), to_timestamp(0)),
                 COALESCE(MAX(cd.connected_at), to_timestamp(0)),
-                COALESCE(MAX(ni.updated_at), to_timestamp(0)),
-                COALESCE(MAX(da.last_accessed), to_timestamp(0)),
                 COALESCE(MAX(te.detected_at), to_timestamp(0)),
                 COALESCE(MAX(bh.created_at), to_timestamp(0))
               ) AS last_recorded_at
@@ -366,10 +251,8 @@ export async function queryTelemetry(req, res, next) {
        JOIN sessions se ON se.id = ss.session_id
        LEFT JOIN live_processes lp ON lp.session_id = se.id AND lp.student_id = st.id
        LEFT JOIN connected_devices cd ON cd.session_id = se.id AND cd.student_id = st.id
-       LEFT JOIN network_info ni ON ni.session_id = se.id AND ni.student_id = st.id
-       LEFT JOIN domain_activity da ON da.session_id = se.id AND da.student_id = st.id
        LEFT JOIN terminal_events te ON te.session_id = se.id AND te.student_id = st.id
-       LEFT JOIN browser_history bh ON bh.session_id = se.id AND bh.student_id = st.id
+      LEFT JOIN browser_history bh ON bh.session_id = se.id::text AND bh.roll_no = st.roll_no
        WHERE se.id = $1
        GROUP BY st.roll_no, st.name, se.id, se.lab_name
        ORDER BY st.roll_no ASC`,
@@ -421,9 +304,9 @@ export async function queryTelemetry(req, res, next) {
       });
     }
 
-    res.json(filtered);
+    return res.json(filtered);
   } catch (err) {
-    next(err);
+    return next(err);
   }
 }
 
@@ -441,167 +324,113 @@ export async function getStudentDetail(req, res, next) {
 
     if (studentRes.rows.length === 0) {
       return res.json({
-        rollNo,
-        sessionId: resolvedSessionId,
-        processes: [],
-        devices: { usb: [], external: [] },
-        network: null,
-        domainActivity: [],
-        terminalEvents: [],
+        devices: [],
         browserHistory: [],
+        processes: [],
+        terminalEvents: [],
       });
     }
 
     const studentId = studentRes.rows[0].id;
 
-    const [processRows, deviceRows, networkRows, domainRows, terminalRows, browserRows] = await Promise.all([
+    const [deviceRows, browserRows, processRows, terminalRows] = await Promise.all([
       query(
-        `SELECT pid, process_name, cpu_percent, memory_mb, status, risk_level, category
-         FROM live_processes
-         WHERE session_id = $1 AND student_id = $2
-         ORDER BY updated_at DESC`,
-        [resolvedSessionId, studentId]
-      ),
-      query(
-        `SELECT device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message
+        `SELECT device_id, readable_name, message, risk_level, metadata
          FROM connected_devices
-         WHERE session_id = $1 AND student_id = $2
+         WHERE session_id = $1 AND student_id = $2 AND COALESCE(device_type, 'usb') = 'usb'
          ORDER BY connected_at DESC`,
         [resolvedSessionId, studentId]
       ),
       query(
-        `SELECT ip_address, gateway, dns, active_connections
-         FROM network_info
-         WHERE session_id = $1 AND student_id = $2
-         ORDER BY updated_at DESC
-         LIMIT 1`,
-        [resolvedSessionId, studentId]
-      ),
-      query(
-        `SELECT domain, request_count, risk_level, last_accessed
-         FROM domain_activity
-         WHERE session_id = $1 AND student_id = $2
-         ORDER BY request_count DESC`,
-        [resolvedSessionId, studentId]
-      ),
-      query(
-        `SELECT event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at
-         FROM terminal_events
-         WHERE session_id = $1 AND student_id = $2
-         ORDER BY detected_at DESC
-         LIMIT 200`,
-        [resolvedSessionId, studentId]
-      ),
-      query(
-        `SELECT url, title, visit_count, last_visit
+        `SELECT url, title, visit_count, last_visited, browser
          FROM browser_history
-         WHERE session_id = $1 AND student_id = $2
-         ORDER BY last_visit DESC
-         LIMIT 500`,
+         WHERE session_id = $1::text AND roll_no = $2`,
+        [String(resolvedSessionId), String(rollNo)]
+      ),
+      query(
+        `SELECT pid, process_name, cpu_percent, memory_mb, status, risk_level
+         FROM live_processes
+         WHERE session_id = $1
+           AND student_id = $2
+           AND risk_level IS NOT NULL
+           AND status <> 'ended'
+         ORDER BY updated_at DESC`,
+        [resolvedSessionId, studentId]
+      ),
+      query(
+        `SELECT id, event_type, tool, detected_at, pid, full_command, remote_ip, remote_port, remote_host, message, risk_level
+         FROM terminal_events
+         WHERE session_id = $1 AND student_id = $2`,
         [resolvedSessionId, studentId]
       ),
     ]);
 
-    const processes = processRows.rows.map((r) => {
-      const c = toCamel(r);
+    const devices = deviceRows.rows.map((row) => {
+      let metadata = row.metadata;
+      if (typeof metadata === 'string') {
+        try {
+          metadata = JSON.parse(metadata);
+        } catch {
+          metadata = {};
+        }
+      }
+      if (!metadata || typeof metadata !== 'object') metadata = {};
+
       return {
-        pid: c.pid,
-        processName: c.processName,
-        cpuPercent: Number(c.cpuPercent ?? 0),
-        memoryMb: Number(c.memoryMb ?? 0),
-        status: c.status,
-        riskLevel: c.riskLevel ?? null,
-        category: c.category ?? null,
+        id: row.device_id,
+        readableName: row.readable_name,
+        message: row.message,
+        riskLevel: row.risk_level,
+        metadata: {
+          mountpoint: metadata.mountpoint ?? null,
+          totalGb: metadata.totalGb ?? metadata.total_gb ?? null,
+        },
       };
     });
 
-    const allDevices = deviceRows.rows.map((r) => {
-      const c = toCamel(r);
-      return {
-        deviceId: c.deviceId,
-        deviceName: c.deviceName,
-        deviceType: c.deviceType,
-        connectedAt: c.connectedAt,
-        disconnectedAt: c.disconnectedAt,
-        readableName: c.readableName,
-        riskLevel: c.riskLevel,
-        message: c.message,
-      };
-    });
+    const browserHistory = browserRows.rows
+      .map((row) => ({
+        url: row.url,
+        title: row.title,
+        visitCount: toInt(row.visit_count, 1),
+        lastVisited: toFloat(row.last_visited, 0),
+        browser: row.browser,
+      }))
+      .sort((a, b) => (b.lastVisited || 0) - (a.lastVisited || 0));
 
-    const network = networkRows.rows[0]
-      ? (() => {
-          const c = toCamel(networkRows.rows[0]);
-          const dns = parseMaybeJsonArray(c.dns);
-          const active = parseMaybeJsonArray(c.activeConnections).map((row) => {
-            const rc = toCamel(row);
-            return {
-              remoteIp: rc.remoteIp,
-              remoteHost: rc.remoteHost,
-              remotePort: rc.remotePort,
-              pid: rc.pid,
-              process: rc.process,
-            };
-          });
-          return {
-            ipAddress: c.ipAddress,
-            gateway: c.gateway,
-            dns,
-            activeConnections: active,
-          };
-        })()
-      : null;
+    const processes = processRows.rows.map((row) => ({
+      pid: row.pid,
+      name: row.process_name,
+      label: row.process_name,
+      cpu: toFloat(row.cpu_percent, 0),
+      memory: toFloat(row.memory_mb, 0),
+      status: row.status,
+      riskLevel: row.risk_level,
+    }));
 
-    const domainActivity = domainRows.rows.map((r) => {
-      const c = toCamel(r);
-      return {
-        domain: c.domain,
-        requestCount: c.requestCount,
-        riskLevel: c.riskLevel,
-        lastAccessed: c.lastAccessed,
-      };
-    });
+    const terminalEvents = terminalRows.rows
+      .map((row) => ({
+        id: row.id,
+        eventType: row.event_type,
+        tool: row.tool,
+        detectedAt: row.detected_at,
+        pid: row.pid,
+        fullCommand: row.full_command,
+        remoteIp: row.remote_ip,
+        remotePort: row.remote_port,
+        remoteHost: row.remote_host,
+        message: row.message,
+        riskLevel: row.risk_level,
+      }))
+      .sort((a, b) => new Date(b.detectedAt || 0).getTime() - new Date(a.detectedAt || 0).getTime());
 
-    const terminalEvents = terminalRows.rows.map((r) => {
-      const c = toCamel(r);
-      return {
-        eventType: c.eventType,
-        tool: c.tool,
-        remoteIp: c.remoteIp,
-        remoteHost: c.remoteHost,
-        remotePort: c.remotePort,
-        pid: c.pid,
-        fullCommand: c.fullCommand,
-        riskLevel: c.riskLevel,
-        message: c.message,
-        detectedAt: c.detectedAt,
-      };
-    });
-
-    const browserHistory = browserRows.rows.map((r) => {
-      const c = toCamel(r);
-      return {
-        url: c.url,
-        title: c.title,
-        visitCount: c.visitCount,
-        lastVisit: c.lastVisit,
-      };
-    });
-
-    res.json({
-      rollNo,
-      sessionId: resolvedSessionId,
-      processes,
-      devices: {
-        usb: allDevices.filter((d) => (d.deviceType || '').toLowerCase() === 'usb'),
-        external: allDevices.filter((d) => (d.deviceType || '').toLowerCase() !== 'usb'),
-      },
-      network,
-      domainActivity,
-      terminalEvents,
+    return res.json({
+      devices,
       browserHistory,
+      processes,
+      terminalEvents,
     });
   } catch (err) {
-    next(err);
+    return next(err);
   }
 }

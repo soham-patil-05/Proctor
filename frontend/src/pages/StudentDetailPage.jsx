@@ -1,47 +1,116 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { Code, History, Terminal, Usb } from 'lucide-react';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
-import StatusBadge from '../components/ui/StatusBadge';
 import { getStudentDetail } from '../services/api';
 
-const TABS = ['Processes', 'Devices', 'Network', 'Domain Activity', 'Terminal Events', 'Browser History'];
-const PROCESS_RISK_ORDER = { dangerous: 0, suspicious: 1, safe: 2 };
+const TABS = [
+  { key: 'devices', label: 'Devices', icon: Usb },
+  { key: 'network', label: 'Network', icon: History },
+  { key: 'processes', label: 'Processes', icon: Terminal },
+  { key: 'terminal', label: 'Terminal', icon: Code },
+];
 
-function riskVariant(level) {
-  const v = (level || '').toLowerCase();
-  if (['dangerous', 'suspicious', 'safe', 'high', 'medium', 'low'].includes(v)) return v;
-  return null;
+const RISK_CONFIG = {
+  high: { label: 'High Risk', dotColor: '#DC2626', bgTint: '#FEF2F2', textColor: '#DC2626' },
+  medium: { label: 'Warning', dotColor: '#D97706', bgTint: '#FFFBEB', textColor: '#D97706' },
+  low: { label: 'Safe', dotColor: '#059669', bgTint: '#ECFDF5', textColor: '#059669' },
+  normal: { label: 'Normal', dotColor: '#059669', bgTint: '#ECFDF5', textColor: '#059669' },
+};
+
+function RiskBadge({ riskLevel }) {
+  const level = String(riskLevel || 'normal').toLowerCase();
+  const cfg = RISK_CONFIG[level] || RISK_CONFIG.normal;
+
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold"
+      style={{ backgroundColor: cfg.bgTint, color: cfg.textColor }}
+    >
+      <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: cfg.dotColor }} />
+      {cfg.label}
+    </span>
+  );
 }
 
-function renderRisk(level) {
-  const variant = riskVariant(level);
-  if (!variant) return '—';
-  return <StatusBadge variant={variant} />;
-}
-
-function toLocalDate(value) {
-  if (!value) return '—';
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return String(value);
-  return d.toLocaleString();
-}
-
-function truncateUrl(url) {
+function hostnameFallback(url) {
   if (!url) return '—';
-  return url.length > 60 ? `${url.slice(0, 60)}...` : url;
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname || url;
+  } catch {
+    return url;
+  }
 }
 
-function tableClass() {
-  return 'w-full text-sm border-collapse';
+function titleFallback(entry) {
+  if (entry?.title) return entry.title;
+  if (!entry?.url) return '—';
+  try {
+    const parsed = new URL(entry.url);
+    return `${parsed.hostname}${parsed.pathname || ''}` || entry.url;
+  } catch {
+    return entry.url;
+  }
 }
 
-function thClass() {
-  return 'border-b border-[var(--color-gray-300)] text-left py-2 px-2 font-semibold';
+function formatUnixTime(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  return new Date(n * 1000).toLocaleTimeString();
 }
 
-function tdClass() {
-  return 'border-b border-[var(--color-gray-200)] py-2 px-2 align-top';
+function formatIsoTime(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleTimeString();
+}
+
+function terminalContent(event) {
+  if ((event?.eventType || '').toLowerCase() === 'terminal_command') {
+    return event?.fullCommand || '—';
+  }
+
+  const bits = [];
+  if (event?.remoteIp && event?.remotePort) {
+    bits.push(`${event.remoteIp}:${event.remotePort}`);
+  } else if (event?.remoteIp) {
+    bits.push(event.remoteIp);
+  }
+  if (event?.remoteHost) {
+    bits.push(`(${event.remoteHost})`);
+  }
+  return bits.join(' ') || '—';
+}
+
+function groupProcesses(processRows) {
+  const grouped = new Map();
+
+  for (const row of processRows) {
+    const groupName = (row.label || row.name || 'Unknown Process').trim();
+    const existing = grouped.get(groupName) || {
+      name: groupName,
+      pids: [],
+      count: 0,
+      totalCpu: 0,
+      totalMemory: 0,
+      riskLevel: row.riskLevel || 'normal',
+    };
+
+    if (row.pid !== null && row.pid !== undefined) {
+      existing.pids.push(row.pid);
+    }
+    existing.count += 1;
+    existing.totalCpu += Number(row.cpu || 0);
+    existing.totalMemory += Number(row.memory || 0);
+    existing.riskLevel = row.riskLevel || existing.riskLevel;
+
+    grouped.set(groupName, existing);
+  }
+
+  return Array.from(grouped.values());
 }
 
 export default function StudentDetailPage() {
@@ -50,10 +119,10 @@ export default function StudentDetailPage() {
   const [search] = useSearchParams();
   const sessionId = search.get('sessionId') || '';
 
-  const [activeTab, setActiveTab] = useState('Processes');
+  const [activeTab, setActiveTab] = useState('devices');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [data, setData] = useState(null);
+  const [data, setData] = useState({ devices: [], browserHistory: [], processes: [], terminalEvents: [] });
 
   useEffect(() => {
     const run = async () => {
@@ -61,60 +130,38 @@ export default function StudentDetailPage() {
         setLoading(true);
         setError('');
         const detail = await getStudentDetail(rollNo, sessionId);
-        setData(detail);
+        setData({
+          devices: Array.isArray(detail?.devices) ? detail.devices : [],
+          browserHistory: Array.isArray(detail?.browserHistory) ? detail.browserHistory : [],
+          processes: Array.isArray(detail?.processes) ? detail.processes : [],
+          terminalEvents: Array.isArray(detail?.terminalEvents) ? detail.terminalEvents : [],
+        });
       } catch (err) {
         setError(err.message || 'Failed to load details');
       } finally {
         setLoading(false);
       }
     };
+
     run();
   }, [rollNo, sessionId]);
 
-  const processes = useMemo(() => {
-    const rows = [...(data?.processes || [])]
-      .filter((p) => (p.status || '').toLowerCase() !== 'ended')
-      .sort((a, b) => {
-        const ra = PROCESS_RISK_ORDER[(a.riskLevel || '').toLowerCase()] ?? 3;
-        const rb = PROCESS_RISK_ORDER[(b.riskLevel || '').toLowerCase()] ?? 3;
-        if (ra !== rb) return ra - rb;
-        return (Number(b.cpuPercent) || 0) - (Number(a.cpuPercent) || 0);
-      });
-    return rows;
-  }, [data]);
-
-  const usbDevices = useMemo(
-    () => (data?.devices?.usb || []).filter((d) => (d.deviceType || '').toLowerCase() === 'usb'),
-    [data]
-  );
-
-  const externalDevices = useMemo(
-    () => (data?.devices?.external || []).filter((d) => (d.deviceType || '').toLowerCase() !== 'usb'),
-    [data]
-  );
-
-  const domainActivity = useMemo(
-    () => [...(data?.domainActivity || [])].sort((a, b) => (Number(b.requestCount) || 0) - (Number(a.requestCount) || 0)),
-    [data]
+  const browserHistory = useMemo(
+    () => [...data.browserHistory].sort((a, b) => Number(b.lastVisited || 0) - Number(a.lastVisited || 0)),
+    [data.browserHistory]
   );
 
   const terminalEvents = useMemo(
-    () => [...(data?.terminalEvents || [])]
-      .sort((a, b) => new Date(b.detectedAt || 0).getTime() - new Date(a.detectedAt || 0).getTime())
-      .slice(0, 200),
-    [data]
+    () => [...data.terminalEvents].sort((a, b) => new Date(b.detectedAt || 0).getTime() - new Date(a.detectedAt || 0).getTime()),
+    [data.terminalEvents]
   );
 
-  const browserHistory = useMemo(
-    () => [...(data?.browserHistory || [])]
-      .sort((a, b) => new Date(b.lastVisit || 0).getTime() - new Date(a.lastVisit || 0).getTime()),
-    [data]
-  );
+  const groupedProcesses = useMemo(() => groupProcesses(data.processes || []), [data.processes]);
+  const highRiskGroups = groupedProcesses.filter((p) => String(p.riskLevel || '').toLowerCase() === 'high');
+  const mediumRiskGroups = groupedProcesses.filter((p) => String(p.riskLevel || '').toLowerCase() === 'medium');
 
   if (loading) return <div className="min-h-screen p-6">Loading...</div>;
   if (error) return <div className="min-h-screen p-6 text-[var(--color-error)]">{error}</div>;
-
-  const activeConnections = Array.isArray(data?.network?.activeConnections) ? data.network.activeConnections : [];
 
   return (
     <div className="min-h-screen bg-[var(--color-gray-50)] p-6">
@@ -127,207 +174,180 @@ export default function StudentDetailPage() {
           <Button variant="secondary" onClick={() => navigate('/')}>Back</Button>
         </div>
 
-        <div className="mb-4 flex flex-wrap gap-2">
-          {TABS.map((tab) => (
-            <Button key={tab} variant={activeTab === tab ? 'primary' : 'outline'} size="sm" onClick={() => setActiveTab(tab)}>
-              {tab}
-            </Button>
-          ))}
+        <div className="mb-4 border-b border-[var(--color-gray-300)] flex flex-wrap gap-2">
+          {TABS.map((tab) => {
+            const Icon = tab.icon;
+            const isActive = activeTab === tab.key;
+            return (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => setActiveTab(tab.key)}
+                className={`inline-flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 ${
+                  isActive
+                    ? 'border-[var(--color-primary)] text-[var(--color-primary)]'
+                    : 'border-transparent text-[var(--color-gray-600)] hover:text-[var(--color-gray-900)]'
+                }`}
+              >
+                <Icon size={16} />
+                {tab.label}
+              </button>
+            );
+          })}
         </div>
 
-        <Card className="p-6 overflow-x-auto">
-          {activeTab === 'Processes' && (
-            <table className={tableClass()}>
-              <thead>
-                <tr>
-                  {['PID', 'Process Name', 'CPU %', 'Memory (MB)', 'Status', 'Risk Level', 'Category'].map((h) => (
-                    <th key={h} className={thClass()}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {processes.map((p, idx) => (
-                  <tr key={`${p.pid}-${idx}`}>
-                    <td className={tdClass()}>{p.pid ?? '—'}</td>
-                    <td className={tdClass()}>{p.processName || '—'}</td>
-                    <td className={tdClass()}>{Number(p.cpuPercent || 0).toFixed(2)}</td>
-                    <td className={tdClass()}>{Number(p.memoryMb || 0).toFixed(1)}</td>
-                    <td className={tdClass()}>{['running', 'sleeping', 'stopped', 'zombie'].includes((p.status || '').toLowerCase()) ? (p.status || '').toLowerCase() : (p.status || '—')}</td>
-                    <td className={tdClass()}>{renderRisk(p.riskLevel)}</td>
-                    <td className={tdClass()}>{p.category || '—'}</td>
-                  </tr>
-                ))}
-                {processes.length === 0 && <tr><td className={tdClass()} colSpan={7}>No process data.</td></tr>}
-              </tbody>
-            </table>
+        <Card className="p-6">
+          {activeTab === 'devices' && (
+            <div className="space-y-3">
+              {data.devices.length === 0 && <p className="text-sm text-[var(--color-gray-600)]">No USB devices connected.</p>}
+              {data.devices.map((device, idx) => {
+                const risk = String(device.riskLevel || 'normal').toLowerCase();
+                const cardTone =
+                  risk === 'high'
+                    ? { borderColor: '#F87171', backgroundColor: '#FEF2F2' }
+                    : risk === 'medium'
+                    ? { borderColor: '#FBBF24', backgroundColor: '#FFFBEB' }
+                    : { borderColor: '#D1D5DB', backgroundColor: '#F9FAFB' };
+
+                return (
+                  <div key={`${device.id || 'dev'}-${idx}`} className="border rounded-lg p-3" style={cardTone}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-semibold text-[var(--color-gray-900)]">{device.readableName || 'USB Storage Device'}</div>
+                        {device.message && <div className="text-xs text-[var(--color-gray-700)] mt-1">{device.message}</div>}
+                        <div className="flex flex-wrap gap-2 mt-2">
+                          {device.metadata?.mountpoint && (
+                            <span className="px-2 py-0.5 rounded-full text-xs bg-white border border-[var(--color-gray-300)]">
+                              {device.metadata.mountpoint}
+                            </span>
+                          )}
+                          {device.metadata?.totalGb !== null && device.metadata?.totalGb !== undefined && (
+                            <span className="px-2 py-0.5 rounded-full text-xs bg-white border border-[var(--color-gray-300)]">
+                              {device.metadata.totalGb} GB
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <RiskBadge riskLevel={device.riskLevel} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
 
-          {activeTab === 'Devices' && (
-            <div className="space-y-8">
+          {activeTab === 'network' && (
+            <div className="space-y-3 max-h-[520px] overflow-y-auto pr-1">
+              {browserHistory.length === 0 && (
+                <p className="text-sm text-[var(--color-gray-600)]">No browsing activity since session started.</p>
+              )}
+              {browserHistory.map((entry, idx) => (
+                <div key={`${entry.url || 'url'}-${idx}`} className="border border-[var(--color-gray-200)] rounded-lg p-3 bg-white">
+                  <div className="font-semibold text-[var(--color-gray-900)]">{titleFallback(entry)}</div>
+                  <div className="text-xs text-blue-700 truncate" title={entry.url || ''}>{entry.url || '—'}</div>
+                  <div className="mt-2 text-xs text-[var(--color-gray-700)] flex flex-wrap gap-3">
+                    <span>{entry.browser || '—'}</span>
+                    <span>{formatUnixTime(entry.lastVisited)}</span>
+                    {Number(entry.visitCount || 1) > 1 && <span>Visits: {entry.visitCount}</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {activeTab === 'processes' && (
+            <div className="space-y-5">
+              {highRiskGroups.length === 0 && mediumRiskGroups.length === 0 && (
+                <p className="text-sm text-[var(--color-gray-600)]">No notable processes detected.</p>
+              )}
+
               <div>
-                <h3 className="font-semibold mb-2">USB Devices</h3>
-                <table className={tableClass()}>
-                  <thead>
-                    <tr>
-                      {['Device Name', 'Readable Name', 'Type', 'Risk Level', 'Connected At', 'Status'].map((h) => (
-                        <th key={h} className={thClass()}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {usbDevices.map((d, idx) => (
-                      <tr key={`usb-${d.deviceId}-${idx}`}>
-                        <td className={tdClass()}>{d.deviceName || '—'}</td>
-                        <td className={tdClass()}>{d.readableName || '—'}</td>
-                        <td className={tdClass()}>{d.deviceType || '—'}</td>
-                        <td className={tdClass()}>{renderRisk(d.riskLevel)}</td>
-                        <td className={tdClass()}>{toLocalDate(d.connectedAt)}</td>
-                        <td className={tdClass()}>{d.disconnectedAt ? 'Disconnected' : 'Connected'}</td>
-                      </tr>
-                    ))}
-                    {usbDevices.length === 0 && <tr><td className={tdClass()} colSpan={6}>No USB devices.</td></tr>}
-                  </tbody>
-                </table>
+                <div className="flex items-center gap-2 mb-2">
+                  <h3 className="font-semibold">High Risk Processes</h3>
+                  <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-[#FEF2F2] text-[#991B1B] animate-pulse">⚠ CRITICAL</span>
+                </div>
+                <div className="space-y-2">
+                  {highRiskGroups.map((group) => (
+                    <div key={`high-${group.name}`} className="border border-[#F87171] rounded-lg p-3 bg-[#FEF2F2] flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-semibold text-[var(--color-gray-900)]">
+                          {group.name}
+                          {group.count > 1 ? ` (${group.count} instances)` : ''}
+                        </div>
+                        <div className="text-xs text-[var(--color-gray-700)] mt-1">
+                          PIDs: {group.pids.join(', ') || '—'} · CPU: {group.totalCpu.toFixed(1)}% · Mem: {group.totalMemory.toFixed(1)} MB
+                        </div>
+                      </div>
+                      <RiskBadge riskLevel={group.riskLevel} />
+                    </div>
+                  ))}
+                </div>
               </div>
 
               <div>
-                <h3 className="font-semibold mb-2">External Drives</h3>
-                <table className={tableClass()}>
-                  <thead>
-                    <tr>
-                      {['Device Name', 'Readable Name', 'Type', 'Risk Level', 'Connected At', 'Status'].map((h) => (
-                        <th key={h} className={thClass()}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {externalDevices.map((d, idx) => (
-                      <tr key={`ext-${d.deviceId}-${idx}`}>
-                        <td className={tdClass()}>{d.deviceName || '—'}</td>
-                        <td className={tdClass()}>{d.readableName || '—'}</td>
-                        <td className={tdClass()}>{d.deviceType || '—'}</td>
-                        <td className={tdClass()}>{renderRisk(d.riskLevel)}</td>
-                        <td className={tdClass()}>{toLocalDate(d.connectedAt)}</td>
-                        <td className={tdClass()}>{d.disconnectedAt ? 'Disconnected' : 'Connected'}</td>
-                      </tr>
-                    ))}
-                    {externalDevices.length === 0 && <tr><td className={tdClass()} colSpan={6}>No external drives.</td></tr>}
-                  </tbody>
-                </table>
+                <h3 className="font-semibold mb-2">Suspicious Processes</h3>
+                <div className="space-y-2">
+                  {mediumRiskGroups.map((group) => (
+                    <div key={`medium-${group.name}`} className="border border-[#FBBF24] rounded-lg p-3 bg-[#FFFBEB] flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-semibold text-[var(--color-gray-900)]">
+                          {group.name}
+                          {group.count > 1 ? ` (${group.count} instances)` : ''}
+                        </div>
+                        <div className="text-xs text-[var(--color-gray-700)] mt-1">
+                          PIDs: {group.pids.join(', ') || '—'} · CPU: {group.totalCpu.toFixed(1)}% · Mem: {group.totalMemory.toFixed(1)} MB
+                        </div>
+                      </div>
+                      <RiskBadge riskLevel={group.riskLevel} />
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
           )}
 
-          {activeTab === 'Network' && (
-            <div className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 bg-[var(--color-gray-100)] p-3 rounded">
-                <div><span className="font-semibold">IP Address:</span> {data?.network?.ipAddress || '—'}</div>
-                <div><span className="font-semibold">Gateway:</span> {data?.network?.gateway || '—'}</div>
-                <div><span className="font-semibold">DNS:</span> {Array.isArray(data?.network?.dns) ? data.network.dns.join(', ') || '—' : '—'}</div>
-              </div>
-              <div>
-                <div className="font-semibold mb-2">Active Connections</div>
-                {activeConnections.length === 0 ? (
-                  <p>No active connections.</p>
-                ) : (
-                  <table className={tableClass()}>
-                    <thead>
-                      <tr>
-                        {['Remote IP', 'Remote Host', 'Remote Port', 'PID', 'Process'].map((h) => (
-                          <th key={h} className={thClass()}>{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {activeConnections.map((c, idx) => (
-                        <tr key={`conn-${idx}`}>
-                          <td className={tdClass()}>{c.remoteIp || '—'}</td>
-                          <td className={tdClass()}>{c.remoteHost || '—'}</td>
-                          <td className={tdClass()}>{c.remotePort || '—'}</td>
-                          <td className={tdClass()}>{c.pid || '—'}</td>
-                          <td className={tdClass()}>{c.process || '—'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
+          {activeTab === 'terminal' && (
+            <div className="space-y-3">
+              {terminalEvents.length === 0 && <p className="text-sm text-[var(--color-gray-600)]">No terminal activity recorded.</p>}
+              {terminalEvents.map((event, idx) => {
+                const risk = String(event.riskLevel || 'normal').toLowerCase();
+                const cardTone =
+                  risk === 'high'
+                    ? { borderColor: '#F87171', backgroundColor: '#FEF2F2' }
+                    : risk === 'medium'
+                    ? { borderColor: '#FBBF24', backgroundColor: '#FFFBEB' }
+                    : { borderColor: '#34D399', backgroundColor: '#ECFDF5' };
+
+                return (
+                  <div key={`${event.id || event.detectedAt || idx}`} className="border rounded-lg p-3" style={cardTone}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-semibold text-[var(--color-gray-900)]">{event.tool || 'unknown'}</span>
+                          <span className="text-xs text-[var(--color-gray-700)]">{formatIsoTime(event.detectedAt)}</span>
+                          {event.pid !== null && event.pid !== undefined && (
+                            <span className="px-2 py-0.5 rounded-full text-xs bg-white border border-[var(--color-gray-300)]">PID: {event.pid}</span>
+                          )}
+                        </div>
+
+                        <pre className="mt-2 p-2 rounded-md bg-[var(--color-gray-900)] text-[var(--color-gray-50)] text-xs overflow-x-auto font-mono">
+                          {terminalContent(event)}
+                        </pre>
+
+                        {event.message && <div className="text-xs text-[var(--color-gray-700)] mt-2">{event.message}</div>}
+                      </div>
+
+                      <div className="flex flex-col items-end gap-2">
+                        <RiskBadge riskLevel={event.riskLevel} />
+                        <span className="text-xs text-[var(--color-gray-700)]">
+                          {(event.eventType || '').toLowerCase() === 'terminal_command' ? 'Auditd' : 'SS'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
-          )}
-
-          {activeTab === 'Domain Activity' && (
-            <table className={tableClass()}>
-              <thead>
-                <tr>
-                  {['Domain', 'Request Count', 'Risk Level', 'Last Accessed'].map((h) => (
-                    <th key={h} className={thClass()}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {domainActivity.map((d, idx) => (
-                  <tr key={`${d.domain}-${idx}`}>
-                    <td className={tdClass()}>{d.domain || '—'}</td>
-                    <td className={tdClass()}>{d.requestCount ?? 0}</td>
-                    <td className={tdClass()}>{renderRisk(d.riskLevel)}</td>
-                    <td className={tdClass()}>{toLocalDate(d.lastAccessed)}</td>
-                  </tr>
-                ))}
-                {domainActivity.length === 0 && <tr><td className={tdClass()} colSpan={4}>No domain activity.</td></tr>}
-              </tbody>
-            </table>
-          )}
-
-          {activeTab === 'Terminal Events' && (
-            <table className={tableClass()}>
-              <thead>
-                <tr>
-                  {['Time', 'Event Type', 'Tool', 'Remote IP', 'Remote Host', 'Port', 'PID', 'Command', 'Risk Level', 'Message'].map((h) => (
-                    <th key={h} className={thClass()}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {terminalEvents.map((e, idx) => (
-                  <tr key={`${e.eventType}-${idx}`}>
-                    <td className={tdClass()}>{toLocalDate(e.detectedAt)}</td>
-                    <td className={tdClass()}>{e.eventType || '—'}</td>
-                    <td className={tdClass()}>{e.tool || '—'}</td>
-                    <td className={tdClass()}>{e.remoteIp || '—'}</td>
-                    <td className={tdClass()}>{e.remoteHost || '—'}</td>
-                    <td className={tdClass()}>{e.remotePort || '—'}</td>
-                    <td className={tdClass()}>{e.pid || '—'}</td>
-                    <td className={tdClass()}>{e.fullCommand || '—'}</td>
-                    <td className={tdClass()}>{renderRisk(e.riskLevel)}</td>
-                    <td className={tdClass()}>{e.message || '—'}</td>
-                  </tr>
-                ))}
-                {terminalEvents.length === 0 && <tr><td className={tdClass()} colSpan={10}>No terminal events.</td></tr>}
-              </tbody>
-            </table>
-          )}
-
-          {activeTab === 'Browser History' && (
-            <table className={tableClass()}>
-              <thead>
-                <tr>
-                  {['URL', 'Title', 'Visit Count', 'Last Visit'].map((h) => (
-                    <th key={h} className={thClass()}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {browserHistory.map((h, idx) => (
-                  <tr key={`${h.url}-${idx}`}>
-                    <td className={tdClass()} title={h.url || ''}>{truncateUrl(h.url)}</td>
-                    <td className={tdClass()}>{h.title || '—'}</td>
-                    <td className={tdClass()}>{h.visitCount ?? 0}</td>
-                    <td className={tdClass()}>{toLocalDate(h.lastVisit)}</td>
-                  </tr>
-                ))}
-                {browserHistory.length === 0 && <tr><td className={tdClass()} colSpan={4}>No browser history.</td></tr>}
-              </tbody>
-            </table>
           )}
         </Card>
       </div>

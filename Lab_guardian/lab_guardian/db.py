@@ -1,19 +1,4 @@
-"""Local SQLite persistence for Lab Guardian.
-
-EXPORT_PAYLOAD_SCHEMA:
-{
-  "sessionId": string,
-  "rollNo": string,
-  "labNo": string,
-  "name": string,
-  "processes": [ { pid, process_name, cpu_percent, memory_mb, status, risk_level, category } ],
-  "devices": [ { device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message } ],
-  "network": { ip_address, gateway, dns, active_connections: [...] } | null,
-  "domainActivity": [ { domain, request_count, risk_level, last_accessed } ],
-  "terminalEvents": [ { event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at } ],
-  "browserHistory": [ { url, title, visit_count, last_visit } ]
-}
-"""
+"""Local SQLite persistence for Lab Guardian canonical telemetry contract."""
 
 from __future__ import annotations
 
@@ -21,25 +6,10 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
-from typing import Any
-from typing import Optional
+from typing import Any, Optional
 
 _DB_LOCK = threading.Lock()
 _DB_PATH = os.environ.get("LG_LOCAL_DB_PATH", os.path.abspath("labguardian_local.db"))
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _to_recorded_at(ts: Optional[float]) -> str:
-    if ts is None:
-        return _now_iso()
-    try:
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-    except Exception:
-        return _now_iso()
 
 
 def _connect() -> sqlite3.Connection:
@@ -48,7 +18,37 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def init_db(db_path: Optional[str] = None) -> None:
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value if value is not None else {}, ensure_ascii=True)
+
+
+def _normalize_risk(value: Any) -> str:
+    risk = str(value or "normal").strip().lower()
+    if risk not in {"high", "medium", "low", "normal"}:
+        return "normal"
+    return risk
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
+    """Initialize local SQLite schema and return a connection."""
     global _DB_PATH
     if db_path:
         _DB_PATH = db_path
@@ -64,109 +64,30 @@ def init_db(db_path: Optional[str] = None) -> None:
                 session_id TEXT NOT NULL,
                 roll_no TEXT NOT NULL,
                 name TEXT,
-                lab_no TEXT NOT NULL,
-                started_at TEXT NOT NULL,
+                lab_no TEXT,
+                started_at TEXT DEFAULT (datetime('now')),
                 ended_at TEXT
             )
             """
         )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS live_processes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                roll_no TEXT NOT NULL,
-                lab_no TEXT NOT NULL,
-                pid INTEGER NOT NULL,
-                process_name TEXT,
-                cpu_percent REAL,
-                memory_mb REAL,
-                status TEXT,
-                risk_level TEXT,
-                category TEXT,
-                recorded_at TEXT NOT NULL,
-                synced INTEGER DEFAULT 0,
-                UNIQUE(session_id, roll_no, pid)
-            )
-            """
-        )
+        # Remove non-canonical local tables if they exist.
+        cur.execute("DROP TABLE IF EXISTS network_info")
+        cur.execute("DROP TABLE IF EXISTS domain_activity")
 
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS connected_devices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                roll_no TEXT NOT NULL,
-                lab_no TEXT NOT NULL,
-                device_id TEXT NOT NULL,
-                device_name TEXT,
-                device_type TEXT,
-                connected_at TEXT,
-                disconnected_at TEXT,
+            CREATE TABLE IF NOT EXISTS usb_devices (
+                session_id    TEXT NOT NULL,
+                roll_no       TEXT NOT NULL,
+                id            TEXT NOT NULL,
                 readable_name TEXT,
-                risk_level TEXT,
-                message TEXT,
-                recorded_at TEXT NOT NULL,
-                synced INTEGER DEFAULT 0,
-                UNIQUE(session_id, roll_no, device_id)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS network_info (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                roll_no TEXT NOT NULL,
-                lab_no TEXT NOT NULL,
-                ip_address TEXT,
-                gateway TEXT,
-                dns TEXT,
-                active_connections TEXT,
-                recorded_at TEXT NOT NULL,
-                synced INTEGER DEFAULT 0,
-                UNIQUE(session_id, roll_no)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS domain_activity (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                roll_no TEXT NOT NULL,
-                lab_no TEXT NOT NULL,
-                domain TEXT NOT NULL,
-                request_count INTEGER DEFAULT 0,
-                risk_level TEXT,
-                last_accessed TEXT,
-                synced INTEGER DEFAULT 0,
-                UNIQUE(session_id, roll_no, domain)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS terminal_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                roll_no TEXT NOT NULL,
-                lab_no TEXT NOT NULL,
-                event_type TEXT,
-                tool TEXT,
-                remote_ip TEXT,
-                remote_host TEXT,
-                remote_port INTEGER,
-                pid INTEGER,
-                full_command TEXT,
-                risk_level TEXT,
-                message TEXT,
-                detected_at TEXT,
-                synced INTEGER DEFAULT 0
+                message       TEXT,
+                risk_level    TEXT,
+                metadata      TEXT,
+                device_type   TEXT,
+                synced        INTEGER DEFAULT 0,
+                PRIMARY KEY (session_id, roll_no, id)
             )
             """
         )
@@ -174,21 +95,60 @@ def init_db(db_path: Optional[str] = None) -> None:
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS browser_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id   TEXT NOT NULL,
+                roll_no      TEXT NOT NULL,
+                url          TEXT NOT NULL,
+                title        TEXT,
+                visit_count  INTEGER DEFAULT 1,
+                last_visited REAL,
+                browser      TEXT,
+                synced       INTEGER DEFAULT 0,
+                PRIMARY KEY (session_id, roll_no, url)
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processes (
                 session_id TEXT NOT NULL,
-                roll_no TEXT NOT NULL,
-                lab_no TEXT NOT NULL,
-                url TEXT,
-                title TEXT,
-                visit_count INTEGER DEFAULT 1,
-                last_visit TEXT,
-                synced INTEGER DEFAULT 0
+                roll_no    TEXT NOT NULL,
+                pid        INTEGER NOT NULL,
+                name       TEXT,
+                label      TEXT,
+                cpu        REAL,
+                memory     REAL,
+                status     TEXT,
+                risk_level TEXT,
+                synced     INTEGER DEFAULT 0,
+                PRIMARY KEY (session_id, roll_no, pid)
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS terminal_events (
+                session_id   TEXT NOT NULL,
+                roll_no      TEXT NOT NULL,
+                id           TEXT,
+                event_type   TEXT,
+                tool         TEXT,
+                detected_at  TEXT,
+                pid          INTEGER,
+                full_command TEXT,
+                remote_ip    TEXT,
+                remote_port  TEXT,
+                remote_host  TEXT,
+                message      TEXT,
+                risk_level   TEXT,
+                synced       INTEGER DEFAULT 0
             )
             """
         )
 
         conn.commit()
-        conn.close()
+        return conn
 
 
 def start_session(session_id: str, roll_no: str, name: str, lab_no: str) -> None:
@@ -196,10 +156,10 @@ def start_session(session_id: str, roll_no: str, name: str, lab_no: str) -> None
         conn = _connect()
         conn.execute(
             """
-            INSERT INTO sessions (session_id, roll_no, name, lab_no, started_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO sessions (session_id, roll_no, name, lab_no)
+            VALUES (?, ?, ?, ?)
             """,
-            (session_id, roll_no, name, lab_no, _now_iso()),
+            (session_id, roll_no, name, lab_no),
         )
         conn.commit()
         conn.close()
@@ -211,547 +171,490 @@ def end_session(session_id: str, roll_no: str) -> None:
         conn.execute(
             """
             UPDATE sessions
-            SET ended_at = ?
+            SET ended_at = datetime('now')
             WHERE session_id = ? AND roll_no = ? AND ended_at IS NULL
             """,
-            (_now_iso(), session_id, roll_no),
+            (session_id, roll_no),
         )
         conn.commit()
         conn.close()
 
 
-def insert_processes(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, ts: Optional[float] = None) -> None:
-    recorded_at = _to_recorded_at(ts)
+def replace_devices(session_id: str, roll_no: str, device_list: list[dict]) -> None:
     with _DB_LOCK:
         conn = _connect()
-
-        if event_type == "process_snapshot":
+        conn.execute("DELETE FROM usb_devices WHERE session_id = ? AND roll_no = ?", (session_id, roll_no))
+        for device in device_list or []:
+            if not isinstance(device, dict):
+                continue
+            device_id = str(device.get("id") or "").strip()
+            if not device_id:
+                continue
+            metadata = device.get("metadata") if isinstance(device.get("metadata"), dict) else {}
             conn.execute(
                 """
-                UPDATE live_processes
-                SET status = 'ended', recorded_at = ?, synced = 0
-                WHERE session_id = ? AND roll_no = ?
-                """,
-                (recorded_at, session_id, roll_no),
-            )
-
-            for proc in data or []:
-                conn.execute(
-                    """
-                    INSERT INTO live_processes
-                    (session_id, roll_no, lab_no, pid, process_name, cpu_percent, memory_mb, status, risk_level, category, recorded_at, synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                    ON CONFLICT(session_id, roll_no, pid)
-                    DO UPDATE SET
-                        process_name = excluded.process_name,
-                        cpu_percent = excluded.cpu_percent,
-                        memory_mb = excluded.memory_mb,
-                        status = excluded.status,
-                        risk_level = excluded.risk_level,
-                        category = excluded.category,
-                        recorded_at = excluded.recorded_at,
-                        synced = 0,
-                        lab_no = excluded.lab_no
-                    """,
-                    (
-                        session_id,
-                        roll_no,
-                        lab_no,
-                        proc.get("pid"),
-                        proc.get("name") or proc.get("process_name"),
-                        proc.get("cpu") if proc.get("cpu") is not None else proc.get("cpu_percent"),
-                        proc.get("memory") if proc.get("memory") is not None else proc.get("memory_mb"),
-                        proc.get("status") or "running",
-                        proc.get("risk_level"),
-                        proc.get("category"),
-                        recorded_at,
-                    ),
-                )
-
-        elif event_type in {"process_new", "process_update"} and isinstance(data, dict):
-            conn.execute(
-                """
-                INSERT INTO live_processes
-                (session_id, roll_no, lab_no, pid, process_name, cpu_percent, memory_mb, status, risk_level, category, recorded_at, synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                ON CONFLICT(session_id, roll_no, pid)
-                DO UPDATE SET
-                    process_name = excluded.process_name,
-                    cpu_percent = excluded.cpu_percent,
-                    memory_mb = excluded.memory_mb,
-                    status = excluded.status,
-                    risk_level = excluded.risk_level,
-                    category = excluded.category,
-                    recorded_at = excluded.recorded_at,
-                    synced = 0,
-                    lab_no = excluded.lab_no
+                INSERT INTO usb_devices (session_id, roll_no, id, readable_name, message, risk_level, metadata, device_type, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'usb', 0)
                 """,
                 (
                     session_id,
                     roll_no,
-                    lab_no,
-                    data.get("pid"),
-                    data.get("name") or data.get("process_name"),
-                    data.get("cpu") if data.get("cpu") is not None else data.get("cpu_percent"),
-                    data.get("memory") if data.get("memory") is not None else data.get("memory_mb"),
-                    data.get("status") or "running",
-                    data.get("risk_level"),
-                    data.get("category"),
-                    recorded_at,
+                    device_id,
+                    device.get("readable_name"),
+                    device.get("message"),
+                    _normalize_risk(device.get("risk_level")),
+                    _json_dumps(metadata),
                 ),
             )
-
-        elif event_type == "process_end" and isinstance(data, dict):
-            conn.execute(
-                """
-                UPDATE live_processes
-                SET status = 'ended', recorded_at = ?, synced = 0
-                WHERE session_id = ? AND roll_no = ? AND pid = ?
-                """,
-                (recorded_at, session_id, roll_no, data.get("pid")),
-            )
-
         conn.commit()
         conn.close()
 
 
-def insert_devices(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, ts: Optional[float] = None) -> None:
-    recorded_at = _to_recorded_at(ts)
-    with _DB_LOCK:
-        conn = _connect()
-
-        if event_type == "devices_snapshot" and isinstance(data, dict):
-            snapshot_ids: set[str] = set()
-            for device_type in ("usb", "external"):
-                for d in data.get(device_type, []) or []:
-                    device_id = str(d.get("id") or d.get("device_id") or "")
-                    if not device_id:
-                        continue
-                    snapshot_ids.add(device_id)
-                    conn.execute(
-                        """
-                        INSERT INTO connected_devices
-                        (session_id, roll_no, lab_no, device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message, recorded_at, synced)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0)
-                        ON CONFLICT(session_id, roll_no, device_id)
-                        DO UPDATE SET
-                            device_name = excluded.device_name,
-                            device_type = excluded.device_type,
-                            connected_at = COALESCE(connected_devices.connected_at, excluded.connected_at),
-                            disconnected_at = NULL,
-                            readable_name = excluded.readable_name,
-                            risk_level = excluded.risk_level,
-                            message = excluded.message,
-                            recorded_at = excluded.recorded_at,
-                            synced = 0,
-                            lab_no = excluded.lab_no
-                        """,
-                        (
-                            session_id,
-                            roll_no,
-                            lab_no,
-                            device_id,
-                            d.get("name") or d.get("device_name"),
-                            device_type,
-                            recorded_at,
-                            d.get("readable_name"),
-                            d.get("risk_level"),
-                            d.get("message"),
-                            recorded_at,
-                        ),
-                    )
-
-            if snapshot_ids:
-                placeholders = ",".join(["?"] * len(snapshot_ids))
-                conn.execute(
-                    f"""
-                    UPDATE connected_devices
-                    SET disconnected_at = ?, recorded_at = ?, synced = 0
-                    WHERE session_id = ? AND roll_no = ? AND device_id NOT IN ({placeholders})
-                    """,
-                    (recorded_at, recorded_at, session_id, roll_no, *list(snapshot_ids)),
-                )
-
-        elif event_type == "device_connected" and isinstance(data, dict):
-            device_id = str(data.get("id") or data.get("device_id") or "")
-            if device_id:
-                device_type = data.get("type") or data.get("device_type") or "usb"
-                conn.execute(
-                    """
-                    INSERT INTO connected_devices
-                    (session_id, roll_no, lab_no, device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message, recorded_at, synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0)
-                    ON CONFLICT(session_id, roll_no, device_id)
-                    DO UPDATE SET
-                        device_name = excluded.device_name,
-                        device_type = excluded.device_type,
-                        connected_at = COALESCE(connected_devices.connected_at, excluded.connected_at),
-                        disconnected_at = NULL,
-                        readable_name = excluded.readable_name,
-                        risk_level = excluded.risk_level,
-                        message = excluded.message,
-                        recorded_at = excluded.recorded_at,
-                        synced = 0,
-                        lab_no = excluded.lab_no
-                    """,
-                    (
-                        session_id,
-                        roll_no,
-                        lab_no,
-                        device_id,
-                        data.get("name") or data.get("device_name"),
-                        device_type,
-                        recorded_at,
-                        data.get("readable_name"),
-                        data.get("risk_level"),
-                        data.get("message"),
-                        recorded_at,
-                    ),
-                )
-
-        elif event_type == "device_disconnected" and isinstance(data, dict):
-            device_id = str(data.get("id") or data.get("device_id") or "")
-            if device_id:
-                conn.execute(
-                    """
-                    UPDATE connected_devices
-                    SET disconnected_at = ?, recorded_at = ?, synced = 0
-                    WHERE session_id = ? AND roll_no = ? AND device_id = ?
-                    """,
-                    (recorded_at, recorded_at, session_id, roll_no, device_id),
-                )
-
-        conn.commit()
-        conn.close()
-
-
-def insert_network(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, ts: Optional[float] = None) -> None:
-    if event_type not in {"network_snapshot", "network_update"} or not isinstance(data, dict):
+def upsert_device(session_id: str, roll_no: str, device: dict) -> None:
+    if not isinstance(device, dict):
         return
-
-    recorded_at = _to_recorded_at(ts)
-    active_connections = data.get("active_connections")
-    if active_connections is None:
-        active_connections = data.get("activeConnections")
-    if active_connections is None:
-        active_connections = []
-
+    device_id = str(device.get("id") or "").strip()
+    if not device_id:
+        return
+    metadata = device.get("metadata") if isinstance(device.get("metadata"), dict) else {}
     with _DB_LOCK:
         conn = _connect()
         conn.execute(
             """
-            INSERT INTO network_info
-            (session_id, roll_no, lab_no, ip_address, gateway, dns, active_connections, recorded_at, synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-            ON CONFLICT(session_id, roll_no)
+            INSERT INTO usb_devices (session_id, roll_no, id, readable_name, message, risk_level, metadata, device_type, synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'usb', 0)
+            ON CONFLICT(session_id, roll_no, id)
             DO UPDATE SET
-                ip_address = excluded.ip_address,
-                gateway = excluded.gateway,
-                dns = excluded.dns,
-                active_connections = excluded.active_connections,
-                recorded_at = excluded.recorded_at,
-                synced = 0,
-                lab_no = excluded.lab_no
+                readable_name = excluded.readable_name,
+                message = excluded.message,
+                risk_level = excluded.risk_level,
+                metadata = excluded.metadata,
+                device_type = 'usb',
+                synced = 0
             """,
             (
                 session_id,
                 roll_no,
-                lab_no,
-                data.get("ip") or data.get("ip_address"),
-                data.get("gateway"),
-                json.dumps(data.get("dns") or [], ensure_ascii=True),
-                json.dumps(active_connections, ensure_ascii=True),
-                recorded_at,
+                device_id,
+                device.get("readable_name"),
+                device.get("message"),
+                _normalize_risk(device.get("risk_level")),
+                _json_dumps(metadata),
             ),
         )
         conn.commit()
         conn.close()
 
 
-def insert_domain_activity(session_id: str, roll_no: str, lab_no: str, data: Any, ts: Optional[float] = None) -> None:
-    recorded_at = _to_recorded_at(ts)
-    rows = data if isinstance(data, list) else []
-
+def remove_device(session_id: str, roll_no: str, device_id: str) -> None:
     with _DB_LOCK:
         conn = _connect()
-        for item in rows:
-            domain = item.get("domain")
-            if not domain:
+        conn.execute(
+            "DELETE FROM usb_devices WHERE session_id = ? AND roll_no = ? AND id = ?",
+            (session_id, roll_no, str(device_id or "")),
+        )
+        conn.commit()
+        conn.close()
+
+
+def upsert_browser_history(session_id: str, roll_no: str, entry: dict) -> None:
+    if not isinstance(entry, dict):
+        return
+    url = str(entry.get("url") or "").strip()
+    if not url:
+        return
+
+    visit_count = _safe_int(entry.get("visit_count")) or 1
+    last_visited = _safe_float(entry.get("last_visited"))
+    with _DB_LOCK:
+        conn = _connect()
+        conn.execute(
+            """
+            INSERT INTO browser_history (session_id, roll_no, url, title, visit_count, last_visited, browser, synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(session_id, roll_no, url)
+            DO UPDATE SET
+                title = COALESCE(excluded.title, browser_history.title),
+                visit_count = MAX(browser_history.visit_count, excluded.visit_count),
+                last_visited = MAX(COALESCE(browser_history.last_visited, 0), COALESCE(excluded.last_visited, 0)),
+                browser = COALESCE(excluded.browser, browser_history.browser),
+                synced = 0
+            """,
+            (session_id, roll_no, url, entry.get("title"), visit_count, last_visited, entry.get("browser")),
+        )
+        conn.commit()
+        conn.close()
+
+
+def replace_processes(session_id: str, roll_no: str, process_list: list[dict]) -> None:
+    with _DB_LOCK:
+        conn = _connect()
+        conn.execute("DELETE FROM processes WHERE session_id = ? AND roll_no = ?", (session_id, roll_no))
+        for process in process_list or []:
+            if not isinstance(process, dict):
                 continue
-            count = item.get("count") if item.get("count") is not None else item.get("request_count")
-            count = int(count or 1)
+            risk = str(process.get("risk_level") or "").lower()
+            status = str(process.get("status") or "running").lower()
+            if risk not in {"high", "medium"} or status == "ended":
+                continue
             conn.execute(
                 """
-                INSERT INTO domain_activity
-                (session_id, roll_no, lab_no, domain, request_count, risk_level, last_accessed, synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-                ON CONFLICT(session_id, roll_no, domain)
-                DO UPDATE SET
-                    request_count = domain_activity.request_count + excluded.request_count,
-                    risk_level = COALESCE(excluded.risk_level, domain_activity.risk_level),
-                    last_accessed = excluded.last_accessed,
-                    synced = 0,
-                    lab_no = excluded.lab_no
+                INSERT INTO processes (session_id, roll_no, pid, name, label, cpu, memory, status, risk_level, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
                     session_id,
                     roll_no,
-                    lab_no,
-                    domain,
-                    count,
-                    item.get("risk_level"),
-                    recorded_at,
+                    _safe_int(process.get("pid")),
+                    process.get("name"),
+                    process.get("label"),
+                    _safe_float(process.get("cpu")) or 0.0,
+                    _safe_float(process.get("memory")) or 0.0,
+                    process.get("status") or "running",
+                    risk,
                 ),
             )
         conn.commit()
         conn.close()
 
 
-def insert_terminal_event(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, ts: Optional[float] = None) -> None:
-    if not isinstance(data, dict):
+def upsert_process(session_id: str, roll_no: str, process: dict) -> None:
+    if not isinstance(process, dict):
         return
-    detected_at = _to_recorded_at(ts)
+    risk = str(process.get("risk_level") or "").lower()
+    status = str(process.get("status") or "running").lower()
+    if risk not in {"high", "medium"} or status == "ended":
+        return
 
     with _DB_LOCK:
         conn = _connect()
         conn.execute(
             """
-            INSERT INTO terminal_events
-            (session_id, roll_no, lab_no, event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at, synced)
+            INSERT INTO processes (session_id, roll_no, pid, name, label, cpu, memory, status, risk_level, synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(session_id, roll_no, pid)
+            DO UPDATE SET
+                name = excluded.name,
+                label = excluded.label,
+                cpu = excluded.cpu,
+                memory = excluded.memory,
+                status = excluded.status,
+                risk_level = excluded.risk_level,
+                synced = 0
+            """,
+            (
+                session_id,
+                roll_no,
+                _safe_int(process.get("pid")),
+                process.get("name"),
+                process.get("label"),
+                _safe_float(process.get("cpu")) or 0.0,
+                _safe_float(process.get("memory")) or 0.0,
+                process.get("status") or "running",
+                risk,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+
+def update_process(session_id: str, roll_no: str, process: dict) -> None:
+    if not isinstance(process, dict):
+        return
+    pid = _safe_int(process.get("pid"))
+    if pid is None:
+        return
+
+    incoming_risk = str(process.get("risk_level") or "").lower()
+    with _DB_LOCK:
+        conn = _connect()
+        existing = conn.execute(
+            "SELECT risk_level FROM processes WHERE session_id = ? AND roll_no = ? AND pid = ?",
+            (session_id, roll_no, pid),
+        ).fetchone()
+
+        existing_risk = str(existing["risk_level"] or "").lower() if existing else ""
+        if incoming_risk not in {"high", "medium"} and existing_risk not in {"high", "medium"}:
+            conn.close()
+            return
+
+        if str(process.get("status") or "").lower() == "ended":
+            conn.execute(
+                "DELETE FROM processes WHERE session_id = ? AND roll_no = ? AND pid = ?",
+                (session_id, roll_no, pid),
+            )
+            conn.commit()
+            conn.close()
+            return
+
+        allowed_fields = ["name", "label", "cpu", "memory", "status", "risk_level"]
+        updates = []
+        params: list[Any] = []
+
+        for field in allowed_fields:
+            if field not in process or process.get(field) is None:
+                continue
+            value = process.get(field)
+            if field in {"cpu", "memory"}:
+                value = _safe_float(value)
+            if field == "risk_level":
+                value = str(value).lower()
+            updates.append(f"{field} = ?")
+            params.append(value)
+
+        if not updates:
+            conn.close()
+            return
+
+        updates.append("synced = 0")
+        sql = f"UPDATE processes SET {', '.join(updates)} WHERE session_id = ? AND roll_no = ? AND pid = ?"
+        params.extend([session_id, roll_no, pid])
+        conn.execute(sql, tuple(params))
+        conn.commit()
+        conn.close()
+
+
+def delete_process(session_id: str, roll_no: str, pid: int) -> None:
+    with _DB_LOCK:
+        conn = _connect()
+        conn.execute(
+            "DELETE FROM processes WHERE session_id = ? AND roll_no = ? AND pid = ?",
+            (session_id, roll_no, _safe_int(pid)),
+        )
+        conn.commit()
+        conn.close()
+
+
+def insert_terminal_event(session_id: str, roll_no: str, event: dict) -> None:
+    if not isinstance(event, dict):
+        return
+    with _DB_LOCK:
+        conn = _connect()
+        conn.execute(
+            """
+            INSERT INTO terminal_events (
+                session_id, roll_no, id, event_type, tool, detected_at, pid,
+                full_command, remote_ip, remote_port, remote_host, message, risk_level, synced
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
             (
                 session_id,
                 roll_no,
-                lab_no,
-                event_type,
-                data.get("tool"),
-                data.get("remote_ip"),
-                data.get("remote_host"),
-                data.get("remote_port"),
-                data.get("pid"),
-                data.get("full_command"),
-                data.get("risk_level"),
-                data.get("message"),
-                detected_at,
+                event.get("id"),
+                event.get("event_type"),
+                event.get("tool"),
+                event.get("detected_at"),
+                _safe_int(event.get("pid")),
+                event.get("full_command"),
+                event.get("remote_ip"),
+                str(event.get("remote_port")) if event.get("remote_port") is not None else None,
+                event.get("remote_host"),
+                event.get("message"),
+                _normalize_risk(event.get("risk_level")),
             ),
         )
         conn.commit()
         conn.close()
 
 
-def insert_browser_history(session_id: str, roll_no: str, lab_no: str, data: Any, ts: Optional[float] = None) -> None:
-    rows = data if isinstance(data, list) else []
-    default_time = _to_recorded_at(ts)
-
+def replace_terminal_events(session_id: str, roll_no: str, event_list: list[dict]) -> None:
     with _DB_LOCK:
         conn = _connect()
-        for item in rows:
-            if not isinstance(item, dict):
+        conn.execute("DELETE FROM terminal_events WHERE session_id = ? AND roll_no = ?", (session_id, roll_no))
+        for event in event_list or []:
+            if not isinstance(event, dict):
                 continue
             conn.execute(
                 """
-                INSERT INTO browser_history
-                (session_id, roll_no, lab_no, url, title, visit_count, last_visit, synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                INSERT INTO terminal_events (
+                    session_id, roll_no, id, event_type, tool, detected_at, pid,
+                    full_command, remote_ip, remote_port, remote_host, message, risk_level, synced
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
                     session_id,
                     roll_no,
-                    lab_no,
-                    item.get("url"),
-                    item.get("title"),
-                    int(item.get("visit_count") or 1),
-                    item.get("last_visit") or default_time,
+                    event.get("id"),
+                    event.get("event_type"),
+                    event.get("tool"),
+                    event.get("detected_at"),
+                    _safe_int(event.get("pid")),
+                    event.get("full_command"),
+                    event.get("remote_ip"),
+                    str(event.get("remote_port")) if event.get("remote_port") is not None else None,
+                    event.get("remote_host"),
+                    event.get("message"),
+                    _normalize_risk(event.get("risk_level")),
                 ),
             )
         conn.commit()
         conn.close()
 
 
-def _load_processes(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
-    where_synced = "AND synced = 0" if unsynced_only else ""
+def _parse_device_metadata(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _load_devices(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> tuple[list[dict], list[int]]:
+    where_synced = " AND synced = 0" if unsynced_only else ""
     rows = conn.execute(
         f"""
-        SELECT pid, process_name, cpu_percent, memory_mb, status, risk_level, category
-        FROM live_processes
-        WHERE session_id = ? AND roll_no = ? {where_synced}
-        ORDER BY recorded_at DESC
+        SELECT rowid, id, readable_name, message, risk_level, metadata, device_type
+        FROM usb_devices
+        WHERE session_id = ? AND roll_no = ?{where_synced}
+        ORDER BY rowid DESC
         """,
         (session_id, roll_no),
     ).fetchall()
-    return [dict(r) for r in rows]
+
+    out = []
+    ids = []
+    for row in rows:
+        item = dict(row)
+        ids.append(int(item.pop("rowid")))
+        item["metadata"] = _parse_device_metadata(item.get("metadata"))
+        out.append(item)
+    return out, ids
 
 
-def _load_devices(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
-    where_synced = "AND synced = 0" if unsynced_only else ""
+def _load_browser_history(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> tuple[list[dict], list[int]]:
+    where_synced = " AND synced = 0" if unsynced_only else ""
     rows = conn.execute(
         f"""
-        SELECT device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message
-        FROM connected_devices
-        WHERE session_id = ? AND roll_no = ? {where_synced}
-        ORDER BY connected_at DESC
+        SELECT rowid, url, title, visit_count, last_visited, browser
+        FROM browser_history
+        WHERE session_id = ? AND roll_no = ?{where_synced}
+        ORDER BY COALESCE(last_visited, 0) DESC
         """,
         (session_id, roll_no),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    ids = []
+    for row in rows:
+        item = dict(row)
+        ids.append(int(item.pop("rowid")))
+        out.append(item)
+    return out, ids
 
 
-def _load_network(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> Optional[dict]:
-    where_synced = "AND synced = 0" if unsynced_only else ""
-    row = conn.execute(
-        f"""
-        SELECT ip_address, gateway, dns, active_connections
-        FROM network_info
-        WHERE session_id = ? AND roll_no = ? {where_synced}
-        ORDER BY recorded_at DESC
-        LIMIT 1
-        """,
-        (session_id, roll_no),
-    ).fetchone()
-    if not row:
-        return None
-
-    out = dict(row)
-    try:
-        out["dns"] = json.loads(out.get("dns") or "[]")
-    except Exception:
-        out["dns"] = []
-
-    try:
-        out["active_connections"] = json.loads(out.get("active_connections") or "[]")
-    except Exception:
-        out["active_connections"] = []
-
-    return out
-
-
-def _load_domain_activity(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
-    where_synced = "AND synced = 0" if unsynced_only else ""
+def _load_processes(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> tuple[list[dict], list[int]]:
+    where_synced = " AND synced = 0" if unsynced_only else ""
     rows = conn.execute(
         f"""
-        SELECT domain, request_count, risk_level, last_accessed
-        FROM domain_activity
-        WHERE session_id = ? AND roll_no = ? {where_synced}
-        ORDER BY request_count DESC
+        SELECT rowid, pid, name, label, cpu, memory, status, risk_level
+        FROM processes
+        WHERE session_id = ? AND roll_no = ?{where_synced}
+        ORDER BY rowid DESC
         """,
         (session_id, roll_no),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    ids = []
+    for row in rows:
+        item = dict(row)
+        ids.append(int(item.pop("rowid")))
+        out.append(item)
+    return out, ids
 
 
-def _load_terminal_events(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
-    where_synced = "AND synced = 0" if unsynced_only else ""
+def _load_terminal_events(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> tuple[list[dict], list[int]]:
+    where_synced = " AND synced = 0" if unsynced_only else ""
     rows = conn.execute(
         f"""
-        SELECT event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at
+        SELECT rowid, id, event_type, tool, detected_at, pid, full_command,
+               remote_ip, remote_port, remote_host, message, risk_level
         FROM terminal_events
-        WHERE session_id = ? AND roll_no = ? {where_synced}
+        WHERE session_id = ? AND roll_no = ?{where_synced}
         ORDER BY detected_at DESC
         """,
         (session_id, roll_no),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    ids = []
+    for row in rows:
+        item = dict(row)
+        ids.append(int(item.pop("rowid")))
+        out.append(item)
+    return out, ids
 
 
-def _load_browser_history(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
-    where_synced = "AND synced = 0" if unsynced_only else ""
-    rows = conn.execute(
-        f"""
-        SELECT url, title, visit_count, last_visit
-        FROM browser_history
-        WHERE session_id = ? AND roll_no = ? {where_synced}
-        ORDER BY last_visit DESC
-        """,
-        (session_id, roll_no),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def _session_info(conn: sqlite3.Connection, session_id: str, roll_no: str) -> tuple[str, str]:
-    row = conn.execute(
-        """
-        SELECT name, lab_no
-        FROM sessions
-        WHERE session_id = ? AND roll_no = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (session_id, roll_no),
-    ).fetchone()
-    if not row:
-        return "", ""
-    return row["name"] or "", row["lab_no"] or ""
-
-
-def get_unsynced_export_payload(session_id: str, roll_no: str) -> tuple[dict, dict[str, list[int]]]:
+def get_all_for_session(session_id: str, roll_no: str) -> dict:
     with _DB_LOCK:
         conn = _connect()
-
-        name, lab_no = _session_info(conn, session_id, roll_no)
-        payload = {
-            "sessionId": session_id,
-            "rollNo": roll_no,
-            "labNo": lab_no,
-            "name": name,
-            "processes": _load_processes(conn, session_id, roll_no, unsynced_only=True),
-            "devices": _load_devices(conn, session_id, roll_no, unsynced_only=True),
-            "network": _load_network(conn, session_id, roll_no, unsynced_only=True),
-            "domainActivity": _load_domain_activity(conn, session_id, roll_no, unsynced_only=True),
-            "terminalEvents": _load_terminal_events(conn, session_id, roll_no, unsynced_only=True),
-            "browserHistory": _load_browser_history(conn, session_id, roll_no, unsynced_only=True),
-        }
-
-        id_map = {
-            "processes": [r["id"] for r in conn.execute("SELECT id FROM live_processes WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
-            "devices": [r["id"] for r in conn.execute("SELECT id FROM connected_devices WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
-            "network": [r["id"] for r in conn.execute("SELECT id FROM network_info WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
-            "domainActivity": [r["id"] for r in conn.execute("SELECT id FROM domain_activity WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
-            "terminalEvents": [r["id"] for r in conn.execute("SELECT id FROM terminal_events WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
-            "browserHistory": [r["id"] for r in conn.execute("SELECT id FROM browser_history WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
-        }
-
+        devices, _ = _load_devices(conn, session_id, roll_no, unsynced_only=False)
+        browser_history, _ = _load_browser_history(conn, session_id, roll_no, unsynced_only=False)
+        processes, _ = _load_processes(conn, session_id, roll_no, unsynced_only=False)
+        terminal_events, _ = _load_terminal_events(conn, session_id, roll_no, unsynced_only=False)
         conn.close()
-        return payload, id_map
 
-
-def mark_synced(id_map: dict[str, list[int]]) -> None:
-    table_map = {
-        "processes": "live_processes",
-        "devices": "connected_devices",
-        "network": "network_info",
-        "domainActivity": "domain_activity",
-        "terminalEvents": "terminal_events",
-        "browserHistory": "browser_history",
+    return {
+        "devices": devices,
+        "browserHistory": browser_history,
+        "processes": processes,
+        "terminalEvents": terminal_events,
     }
 
+
+def get_unsynced(session_id: str, roll_no: str) -> tuple[dict, dict[str, list[int]]]:
     with _DB_LOCK:
         conn = _connect()
-        for key, ids in id_map.items():
-            table = table_map.get(key)
-            if not table or not ids:
-                continue
-            placeholders = ",".join(["?"] * len(ids))
-            conn.execute(f"UPDATE {table} SET synced = 1 WHERE id IN ({placeholders})", ids)
+        devices, device_ids = _load_devices(conn, session_id, roll_no, unsynced_only=True)
+        browser_history, browser_ids = _load_browser_history(conn, session_id, roll_no, unsynced_only=True)
+        processes, process_ids = _load_processes(conn, session_id, roll_no, unsynced_only=True)
+        terminal_events, terminal_ids = _load_terminal_events(conn, session_id, roll_no, unsynced_only=True)
+        conn.close()
+
+    return (
+        {
+            "devices": devices,
+            "browserHistory": browser_history,
+            "processes": processes,
+            "terminalEvents": terminal_events,
+        },
+        {
+            "devices": device_ids,
+            "browserHistory": browser_ids,
+            "processes": process_ids,
+            "terminalEvents": terminal_ids,
+        },
+    )
+
+
+def mark_synced(session_id: str, roll_no: str) -> None:
+    with _DB_LOCK:
+        conn = _connect()
+        conn.execute("UPDATE usb_devices SET synced = 1 WHERE session_id = ? AND roll_no = ?", (session_id, roll_no))
+        conn.execute("UPDATE browser_history SET synced = 1 WHERE session_id = ? AND roll_no = ?", (session_id, roll_no))
+        conn.execute("UPDATE processes SET synced = 1 WHERE session_id = ? AND roll_no = ?", (session_id, roll_no))
+        conn.execute("UPDATE terminal_events SET synced = 1 WHERE session_id = ? AND roll_no = ?", (session_id, roll_no))
         conn.commit()
         conn.close()
 
 
-def get_latest_session_payload(session_id: str, roll_no: str) -> dict:
+def get_session_info(session_id: str, roll_no: str) -> tuple[str, str]:
     with _DB_LOCK:
         conn = _connect()
-        name, lab_no = _session_info(conn, session_id, roll_no)
-        out = {
-            "sessionId": session_id,
-            "rollNo": roll_no,
-            "labNo": lab_no,
-            "name": name,
-            "processes": _load_processes(conn, session_id, roll_no, unsynced_only=False),
-            "devices": _load_devices(conn, session_id, roll_no, unsynced_only=False),
-            "network": _load_network(conn, session_id, roll_no, unsynced_only=False),
-            "domainActivity": _load_domain_activity(conn, session_id, roll_no, unsynced_only=False),
-            "terminalEvents": _load_terminal_events(conn, session_id, roll_no, unsynced_only=False),
-            "browserHistory": _load_browser_history(conn, session_id, roll_no, unsynced_only=False),
-        }
+        row = conn.execute(
+            """
+            SELECT name, lab_no
+            FROM sessions
+            WHERE session_id = ? AND roll_no = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session_id, roll_no),
+        ).fetchone()
         conn.close()
-        return out
+    if not row:
+        return "", ""
+    return row["name"] or "", row["lab_no"] or ""

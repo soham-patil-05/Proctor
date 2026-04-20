@@ -2,28 +2,18 @@
 
 import asyncio
 import errno
+import json
 import os
 import socket
 import threading
 import tkinter as tk
 from datetime import datetime
 from tkinter import ttk
+from urllib.parse import urlparse
 
 import requests
 
 from . import config, db, dispatcher
-
-
-RISK_COLORS = {
-    "dangerous": ("#FDECEA", "#C62828"),
-    "high": ("#FDECEA", "#C62828"),
-    "suspicious": ("#FFF8E1", "#F57F17"),
-    "medium": ("#FFF8E1", "#F57F17"),
-    "safe": ("#E8F5E9", "#2E7D32"),
-    "low": ("#E8F5E9", "#2E7D32"),
-}
-
-PROCESS_RISK_ORDER = {"dangerous": 0, "suspicious": 1, "safe": 2}
 
 
 class MonitorRuntime:
@@ -112,7 +102,8 @@ class LabGuardianGUI:
         self._apply_theme()
         self._try_set_icon()
 
-        db.init_db()
+        conn = db.init_db()
+        conn.close()
 
         self.runtime = MonitorRuntime()
         self.active_session = None
@@ -229,11 +220,10 @@ class LabGuardianGUI:
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        tree.tag_configure("evenrow", background="#F5F5F5")
-        tree.tag_configure("oddrow", background="#FFFFFF")
-        tree.tag_configure("risk_high", background="#FDECEA", foreground="#C62828")
-        tree.tag_configure("risk_medium", background="#FFF8E1", foreground="#F57F17")
-        tree.tag_configure("risk_low", background="#E8F5E9", foreground="#2E7D32")
+        tree.tag_configure("high", background="#FEF2F2", foreground="#991B1B")
+        tree.tag_configure("medium", background="#FFFBEB", foreground="#92400E")
+        tree.tag_configure("low", background="#ECFDF5", foreground="#065F46")
+        tree.tag_configure("normal", background="#ECFDF5", foreground="#065F46")
         return tree
 
     def _build_session_screen(self):
@@ -250,76 +240,61 @@ class LabGuardianGUI:
         self.notebook = ttk.Notebook(self.session_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        processes_tab = ttk.Frame(self.notebook)
         devices_tab = ttk.Frame(self.notebook)
         network_tab = ttk.Frame(self.notebook)
-        domains_tab = ttk.Frame(self.notebook)
+        processes_tab = ttk.Frame(self.notebook)
         terminal_tab = ttk.Frame(self.notebook)
-        browser_tab = ttk.Frame(self.notebook)
 
-        self.notebook.add(processes_tab, text="Processes")
         self.notebook.add(devices_tab, text="Devices")
         self.notebook.add(network_tab, text="Network")
-        self.notebook.add(domains_tab, text="Domain Activity")
-        self.notebook.add(terminal_tab, text="Terminal Events")
-        self.notebook.add(browser_tab, text="Browser History")
+        self.notebook.add(processes_tab, text="Processes")
+        self.notebook.add(terminal_tab, text="Terminal")
 
-        self.process_tree = self._tree_with_scroll(
-            processes_tab,
-            ("pid", "process_name", "cpu_percent", "memory_mb", "status", "risk_level", "category"),
-            ("PID", "Process Name", "CPU %", "Memory (MB)", "Status", "Risk Level", "Category"),
-        )
-
-        ttk.Label(devices_tab, text="USB Devices", style="FieldLabel.TLabel").pack(anchor="w", padx=8, pady=(8, 2))
-        self.usb_tree = self._tree_with_scroll(
+        # Devices tab
+        self.devices_empty_var = tk.StringVar(value="")
+        self.device_tree = self._tree_with_scroll(
             devices_tab,
-            ("device_name", "readable_name", "device_type", "risk_level", "connected_at", "status"),
-            ("Device Name", "Readable Name", "Type", "Risk Level", "Connected At", "Status"),
+            ("readable_name", "message", "mountpoint", "size_gb", "risk_level"),
+            ("Device Name", "Description", "Mount Point", "Size (GB)", "Risk"),
         )
+        tk.Label(devices_tab, textvariable=self.devices_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(4, 8))
 
-        ttk.Label(devices_tab, text="External Drives", style="FieldLabel.TLabel").pack(anchor="w", padx=8, pady=(8, 2))
-        self.external_tree = self._tree_with_scroll(
-            devices_tab,
-            ("device_name", "readable_name", "device_type", "risk_level", "connected_at", "status"),
-            ("Device Name", "Readable Name", "Type", "Risk Level", "Connected At", "Status"),
-        )
-
-        info = ttk.Frame(network_tab, padding=8)
-        info.pack(fill=tk.X)
-        self.ip_var = tk.StringVar(value="-")
-        self.gateway_var = tk.StringVar(value="-")
-        self.dns_var = tk.StringVar(value="-")
-        ttk.Label(info, text="IP Address:", style="FieldLabel.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(info, textvariable=self.ip_var).grid(row=0, column=1, sticky="w", padx=(6, 0))
-        ttk.Label(info, text="Gateway:", style="FieldLabel.TLabel").grid(row=1, column=0, sticky="w")
-        ttk.Label(info, textvariable=self.gateway_var).grid(row=1, column=1, sticky="w", padx=(6, 0))
-        ttk.Label(info, text="DNS:", style="FieldLabel.TLabel").grid(row=2, column=0, sticky="w")
-        ttk.Label(info, textvariable=self.dns_var).grid(row=2, column=1, sticky="w", padx=(6, 0))
-
-        ttk.Label(network_tab, text="Active Connections", style="FieldLabel.TLabel").pack(anchor="w", padx=8, pady=(2, 2))
-        self.connections_tree = self._tree_with_scroll(
+        # Network tab
+        self.network_empty_var = tk.StringVar(value="")
+        self.network_tree = self._tree_with_scroll(
             network_tab,
-            ("remote_ip", "remote_host", "remote_port", "pid", "process"),
-            ("Remote IP", "Remote Host", "Remote Port", "PID", "Process"),
+            ("title", "url", "browser", "last_visited", "visit_count"),
+            ("Page Title", "URL", "Browser", "Last Visited", "Visits"),
+        )
+        tk.Label(network_tab, textvariable=self.network_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(4, 8))
+
+        # Processes tab
+        self.processes_empty_var = tk.StringVar(value="")
+        high_frame = ttk.LabelFrame(processes_tab, text="⚠ High Risk Processes", padding=6)
+        high_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+        self.high_process_tree = self._tree_with_scroll(
+            high_frame,
+            ("display_name", "pids", "cpu", "memory", "instances"),
+            ("Process Name", "PIDs", "CPU %", "Memory (MB)", "Instances"),
         )
 
-        self.domain_tree = self._tree_with_scroll(
-            domains_tab,
-            ("domain", "request_count", "risk_level", "last_accessed"),
-            ("Domain", "Request Count", "Risk Level", "Last Accessed"),
+        medium_frame = ttk.LabelFrame(processes_tab, text="Suspicious Processes", padding=6)
+        medium_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+        self.medium_process_tree = self._tree_with_scroll(
+            medium_frame,
+            ("display_name", "pids", "cpu", "memory", "instances"),
+            ("Process Name", "PIDs", "CPU %", "Memory (MB)", "Instances"),
         )
+        tk.Label(processes_tab, textvariable=self.processes_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(0, 8))
 
+        # Terminal tab
+        self.terminal_empty_var = tk.StringVar(value="")
         self.terminal_tree = self._tree_with_scroll(
             terminal_tab,
-            ("time", "event_type", "tool", "remote_ip", "remote_host", "port", "pid", "command", "risk_level", "message"),
-            ("Time", "Event Type", "Tool", "Remote IP", "Remote Host", "Port", "PID", "Command", "Risk Level", "Message"),
+            ("tool", "detected_at", "pid", "content", "source", "message", "risk_level"),
+            ("Tool", "Time", "PID", "Command / Connection", "Source", "Message", "Risk"),
         )
-
-        self.browser_tree = self._tree_with_scroll(
-            browser_tab,
-            ("url", "title", "visit_count", "last_visit"),
-            ("URL", "Title", "Visit Count", "Last Visit"),
-        )
+        tk.Label(terminal_tab, textvariable=self.terminal_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(4, 8))
 
         self.status_bar = tk.Label(self.session_frame, textvariable=self.status_bar_var, bg="#ECEFF1", fg="#546E7A", font=("Segoe UI", 8), anchor="w")
         self.status_bar.pack(fill=tk.X)
@@ -332,8 +307,8 @@ class LabGuardianGUI:
         self.start_frame.pack_forget()
         self.session_frame.pack(fill=tk.BOTH, expand=True)
 
-    def _record_count(self, id_map):
-        return sum(len(v) for v in id_map.values())
+    def _record_count(self, data_map):
+        return sum(len(data_map.get(k, [])) for k in ("devices", "browserHistory", "processes", "terminalEvents"))
 
     def _set_export_state(self, loading: bool):
         self.export_btn.configure(state=tk.DISABLED if loading else tk.NORMAL)
@@ -377,7 +352,6 @@ class LabGuardianGUI:
     def on_end_session(self):
         if not self.active_session:
             return
-
         EndSessionDialog(self.root, self._confirm_end_session)
 
     def _confirm_end_session(self):
@@ -407,6 +381,9 @@ class LabGuardianGUI:
     def on_export(self):
         roll_no = self.roll_var.get().strip()
         session_id = self.session_var.get().strip()
+        lab_no = self.lab_var.get().strip()
+        name = self.name_var.get().strip()
+
         if not roll_no or not session_id:
             self._show_start_message("Roll No. and Session ID are required for export.", success=False)
             return
@@ -422,10 +399,36 @@ class LabGuardianGUI:
                 self.root.after(0, lambda: self._export_done(False, "Backend server is not reachable. Try again later."))
                 return
 
-            payload, id_map = db.get_unsynced_export_payload(session_id, roll_no)
-            if self._record_count(id_map) == 0:
+            unsynced_data, _row_ids = db.get_unsynced(session_id, roll_no)
+            if self._record_count(unsynced_data) == 0:
                 self.root.after(0, lambda: self._export_done(False, "No unsynced records found."))
                 return
+
+            devices = []
+            for device in unsynced_data.get("devices", []):
+                d = dict(device)
+                metadata = d.get("metadata")
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except Exception:
+                        metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                d["metadata"] = metadata
+                d["device_type"] = "usb"
+                devices.append(d)
+
+            payload = {
+                "sessionId": session_id,
+                "rollNo": roll_no,
+                "labNo": lab_no,
+                "name": name,
+                "devices": devices,
+                "browserHistory": unsynced_data.get("browserHistory", []),
+                "processes": unsynced_data.get("processes", []),
+                "terminalEvents": unsynced_data.get("terminalEvents", []),
+            }
 
             try:
                 response = requests.post(
@@ -439,12 +442,8 @@ class LabGuardianGUI:
                     self.root.after(0, lambda: self._export_done(False, "Export failed: server did not confirm success."))
                     return
 
-                db.mark_synced(id_map)
-                stored = body.get("stored") or {}
-                total = sum(int(v or 0) for v in stored.values())
-                if total <= 0:
-                    total = self._record_count(id_map)
-                self.root.after(0, lambda: self._export_done(True, f"Export complete. {total} records synced."))
+                db.mark_synced(session_id, roll_no)
+                self.root.after(0, lambda: self._export_done(True, "Export complete. Data synced."))
             except requests.exceptions.Timeout:
                 self.root.after(0, lambda: self._export_done(False, "Export timed out. Check network and try again."))
             except requests.exceptions.ConnectionError:
@@ -469,164 +468,219 @@ class LabGuardianGUI:
         self._set_export_state(False)
         self._show_start_message(message, success=success)
 
-    def _format_dt(self, value):
-        if not value:
-            return "-"
-        try:
-            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone().strftime("%c")
-        except Exception:
-            return str(value)
-
-    def _risk_tag(self, risk_level: str):
-        if risk_level in {"dangerous", "high"}:
-            return "risk_high"
-        if risk_level in {"suspicious", "medium"}:
-            return "risk_medium"
-        if risk_level in {"safe", "low"}:
-            return "risk_low"
-        return ""
-
     def _clear_tree(self, tree):
-        for i in tree.get_children():
-            tree.delete(i)
+        for item in tree.get_children():
+            tree.delete(item)
 
-    def _insert_rows(self, tree, rows, value_builder, risk_getter=None):
-        self._clear_tree(tree)
-        for idx, row in enumerate(rows):
-            base_tag = "evenrow" if idx % 2 == 0 else "oddrow"
-            tags = [base_tag]
-            if risk_getter:
-                risk_tag = self._risk_tag(risk_getter(row))
-                if risk_tag:
-                    tags = [risk_tag]
-            tree.insert("", tk.END, values=value_builder(row), tags=tuple(tags))
+    def _risk_tag(self, risk_level: str) -> str:
+        risk = str(risk_level or "normal").lower()
+        if risk in {"high", "medium", "low", "normal"}:
+            return risk
+        return "normal"
+
+    def _truncate(self, value: str, length: int = 60) -> str:
+        if value is None:
+            return ""
+        text = str(value)
+        return text if len(text) <= length else f"{text[:length]}..."
+
+    def _safe_time_from_iso(self, value: str) -> str:
+        if not value:
+            return "—"
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%H:%M:%S")
+        except Exception:
+            return "—"
+
+    def _safe_time_from_unix(self, value):
+        if value is None:
+            return "—"
+        try:
+            return datetime.fromtimestamp(float(value)).strftime("%H:%M:%S")
+        except Exception:
+            return "—"
+
+    def _title_fallback(self, url: str) -> str:
+        if not url:
+            return "—"
+        try:
+            parsed = urlparse(url)
+            host = parsed.netloc or ""
+            path = parsed.path or ""
+            text = (host + path).strip()
+            return text or url
+        except Exception:
+            return url
+
+    def _group_processes(self, processes: list[dict]) -> list[dict]:
+        grouped = {}
+        for row in processes:
+            name = (row.get("label") or row.get("name") or "Unknown Process").strip()
+            bucket = grouped.setdefault(
+                name,
+                {
+                    "display_name": name,
+                    "pids": [],
+                    "total_cpu": 0.0,
+                    "total_memory": 0.0,
+                    "count": 0,
+                    "risk_level": (row.get("risk_level") or "normal").lower(),
+                },
+            )
+            if row.get("pid") is not None:
+                bucket["pids"].append(int(row.get("pid")))
+            bucket["total_cpu"] += float(row.get("cpu") or 0.0)
+            bucket["total_memory"] += float(row.get("memory") or 0.0)
+            bucket["count"] += 1
+        return list(grouped.values())
 
     def refresh_session_view(self):
         if not self.active_session:
             return
 
-        payload = db.get_latest_session_payload(self.active_session["sessionId"], self.active_session["rollNo"])
+        payload = db.get_all_for_session(self.active_session["sessionId"], self.active_session["rollNo"])
 
-        processes = [p for p in payload.get("processes", []) if (p.get("status") or "").lower() != "ended"]
-        processes.sort(
-            key=lambda p: (
-                PROCESS_RISK_ORDER.get((p.get("risk_level") or "").lower(), 3),
-                -(float(p.get("cpu_percent") or 0)),
-            )
-        )
-        self._insert_rows(
-            self.process_tree,
-            processes,
-            lambda p: (
-                p.get("pid"),
-                p.get("process_name") or "-",
-                f"{float(p.get('cpu_percent') or 0):.2f}",
-                f"{float(p.get('memory_mb') or 0):.1f}",
-                p.get("status") or "-",
-                p.get("risk_level") or "-",
-                p.get("category") or "-",
-            ),
-            lambda p: (p.get("risk_level") or "").lower(),
-        )
-
+        # Devices
         devices = payload.get("devices", [])
-        usb_devices = [d for d in devices if (d.get("device_type") or "").lower() == "usb"]
-        external_devices = [d for d in devices if (d.get("device_type") or "").lower() != "usb"]
+        self._clear_tree(self.device_tree)
+        for row in devices:
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            self.device_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.get("readable_name") or "USB Storage Device",
+                    row.get("message") or "",
+                    metadata.get("mountpoint") or "—",
+                    metadata.get("total_gb") if metadata.get("total_gb") is not None else "—",
+                    (row.get("risk_level") or "normal").lower(),
+                ),
+                tags=(self._risk_tag(row.get("risk_level")),),
+            )
+        self.devices_empty_var.set("No USB devices connected." if not devices else "")
 
-        def _device_values(d):
-            status = "Connected" if not d.get("disconnected_at") else "Disconnected"
-            return (
-                d.get("device_name") or "-",
-                d.get("readable_name") or "-",
-                d.get("device_type") or "-",
-                d.get("risk_level") or "-",
-                self._format_dt(d.get("connected_at")),
-                status,
+        # Network (Browser History)
+        browser_history = sorted(
+            payload.get("browserHistory", []),
+            key=lambda item: float(item.get("last_visited") or 0),
+            reverse=True,
+        )
+        self._clear_tree(self.network_tree)
+        for row in browser_history:
+            title = row.get("title") or self._title_fallback(row.get("url") or "")
+            self.network_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    title,
+                    self._truncate(row.get("url") or "", 60),
+                    row.get("browser") or "—",
+                    self._safe_time_from_unix(row.get("last_visited")),
+                    int(row.get("visit_count") or 1),
+                ),
+            )
+        self.network_empty_var.set("No browsing activity since session started." if not browser_history else "")
+
+        # Processes
+        process_rows = [
+            row
+            for row in payload.get("processes", [])
+            if str(row.get("status") or "").lower() != "ended"
+            and str(row.get("risk_level") or "").lower() in {"high", "medium"}
+        ]
+
+        high_groups = self._group_processes([r for r in process_rows if str(r.get("risk_level") or "").lower() == "high"])
+        medium_groups = self._group_processes([r for r in process_rows if str(r.get("risk_level") or "").lower() == "medium"])
+
+        self._clear_tree(self.high_process_tree)
+        for row in high_groups:
+            pids = ", ".join(str(pid) for pid in sorted(row.get("pids", [])))
+            self.high_process_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.get("display_name"),
+                    pids,
+                    f"{row.get('total_cpu', 0.0):.1f}",
+                    f"{row.get('total_memory', 0.0):.1f}",
+                    row.get("count") if row.get("count", 0) > 1 else "",
+                ),
+                tags=("high",),
             )
 
-        self._insert_rows(self.usb_tree, usb_devices, _device_values, lambda d: (d.get("risk_level") or "").lower())
-        self._insert_rows(self.external_tree, external_devices, _device_values, lambda d: (d.get("risk_level") or "").lower())
+        self._clear_tree(self.medium_process_tree)
+        for row in medium_groups:
+            pids = ", ".join(str(pid) for pid in sorted(row.get("pids", [])))
+            self.medium_process_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.get("display_name"),
+                    pids,
+                    f"{row.get('total_cpu', 0.0):.1f}",
+                    f"{row.get('total_memory', 0.0):.1f}",
+                    row.get("count") if row.get("count", 0) > 1 else "",
+                ),
+                tags=("medium",),
+            )
 
-        network = payload.get("network") or {}
-        self.ip_var.set(network.get("ip_address") or "-")
-        self.gateway_var.set(network.get("gateway") or "-")
-        dns = network.get("dns") or []
-        self.dns_var.set(", ".join(dns) if isinstance(dns, list) else str(dns or "-"))
+        if not high_groups and not medium_groups:
+            self.processes_empty_var.set("No notable processes detected.")
+        else:
+            self.processes_empty_var.set("")
 
-        active_connections = network.get("active_connections") or []
-        if not isinstance(active_connections, list):
-            active_connections = []
-        self._insert_rows(
-            self.connections_tree,
-            active_connections,
-            lambda c: (
-                c.get("remote_ip") or "-",
-                c.get("remote_host") or "-",
-                c.get("remote_port") or "-",
-                c.get("pid") or "-",
-                c.get("process") or "-",
-            ),
+        # Terminal
+        terminal_rows = sorted(
+            payload.get("terminalEvents", []),
+            key=lambda item: str(item.get("detected_at") or ""),
+            reverse=True,
+        )
+        self._clear_tree(self.terminal_tree)
+
+        for row in terminal_rows:
+            event_type = str(row.get("event_type") or "")
+            if event_type == "terminal_command":
+                content = row.get("full_command") or "—"
+                source = "Auditd"
+            else:
+                ip = row.get("remote_ip") or ""
+                port = row.get("remote_port") or ""
+                host = row.get("remote_host") or ""
+                parts = []
+                if ip and port:
+                    parts.append(f"{ip}:{port}")
+                elif ip:
+                    parts.append(str(ip))
+                if host:
+                    parts.append(f"({host})")
+                content = " ".join(parts) if parts else "—"
+                source = "SS"
+
+            self.terminal_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.get("tool") or "unknown",
+                    self._safe_time_from_iso(row.get("detected_at")),
+                    row.get("pid") if row.get("pid") is not None else "—",
+                    content,
+                    source,
+                    row.get("message") or "—",
+                    (row.get("risk_level") or "normal").lower(),
+                ),
+                tags=(self._risk_tag(row.get("risk_level")),),
+            )
+
+        self.terminal_empty_var.set("No terminal activity recorded." if not terminal_rows else "")
+
+        self.status_bar_var.set(
+            f"Last updated: {datetime.now().strftime('%H:%M:%S')} | Devices: {len(devices)} | "
+            f"History: {len(browser_history)} | Processes: {len(process_rows)} | Terminal: {len(terminal_rows)}"
         )
 
-        domain_rows = payload.get("domainActivity", [])
-        domain_rows.sort(key=lambda d: -int(d.get("request_count") or 0))
-        self._insert_rows(
-            self.domain_tree,
-            domain_rows,
-            lambda d: (
-                d.get("domain") or "-",
-                d.get("request_count") or 0,
-                d.get("risk_level") or "-",
-                self._format_dt(d.get("last_accessed")),
-            ),
-            lambda d: (d.get("risk_level") or "").lower(),
-        )
-
-        terminal_rows = payload.get("terminalEvents", [])
-        terminal_rows.sort(key=lambda t: str(t.get("detected_at") or ""), reverse=True)
-        terminal_rows = terminal_rows[:200]
-        self._insert_rows(
-            self.terminal_tree,
-            terminal_rows,
-            lambda t: (
-                self._format_dt(t.get("detected_at")),
-                t.get("event_type") or "-",
-                t.get("tool") or "-",
-                t.get("remote_ip") or "-",
-                t.get("remote_host") or "-",
-                t.get("remote_port") or "-",
-                t.get("pid") or "-",
-                t.get("full_command") or "-",
-                t.get("risk_level") or "-",
-                t.get("message") or "-",
-            ),
-            lambda t: (t.get("risk_level") or "").lower(),
-        )
-
-        history_rows = payload.get("browserHistory", [])
-        history_rows.sort(key=lambda h: str(h.get("last_visit") or ""), reverse=True)
-        self._insert_rows(
-            self.browser_tree,
-            history_rows,
-            lambda h: (
-                h.get("url") or "-",
-                h.get("title") or "-",
-                h.get("visit_count") or 0,
-                self._format_dt(h.get("last_visit")),
-            ),
-        )
-
-        status = (
-            f"Last updated: {datetime.now().strftime('%H:%M:%S')} | "
-            f"Processes: {len(processes)} | "
-            f"Devices: {len(devices)} | "
-            f"Domain Activity: {len(domain_rows)} | "
-            f"Terminal Events: {len(terminal_rows)} | "
-            f"Browser History: {len(history_rows)}"
-        )
-        self.status_bar_var.set(status)
-
-        self.root.after(max(1000, int(config.SNAPSHOT_INTERVAL * 1000)), self.refresh_session_view)
+        interval_seconds = int(getattr(config, "MONITOR_INTERVAL", getattr(config, "SNAPSHOT_INTERVAL", 5)))
+        interval_ms = max(1000, interval_seconds * 1000)
+        self.root.after(interval_ms, self.refresh_session_view)
 
     def on_close(self):
         if self.runtime.running:
@@ -645,4 +699,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

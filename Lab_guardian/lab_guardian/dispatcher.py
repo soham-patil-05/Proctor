@@ -1,39 +1,120 @@
-"""dispatcher.py — Orchestrate monitors and persist events to local SQLite."""
+"""dispatcher.py — Orchestrate monitors and persist canonical events to SQLite."""
 
 import asyncio
 import logging
+import time
+from datetime import datetime
 from typing import Optional
 
 from . import db
-from .monitor import process_monitor, device_monitor, network_monitor, browser_history
+from .monitor import browser_history, device_monitor, network_monitor, process_monitor
 
 log = logging.getLogger("lab_guardian.dispatcher")
 
 
-async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[asyncio.Event] = None):
-    """Start all monitors and persist event stream to local DB.
+def _normalize_device(device: dict) -> dict:
+    metadata = device.get("metadata") if isinstance(device.get("metadata"), dict) else {}
+    return {
+        "id": str(device.get("id") or device.get("device_id") or "").strip(),
+        "readable_name": device.get("readable_name") or device.get("device_name") or device.get("name"),
+        "message": device.get("message"),
+        "risk_level": (device.get("risk_level") or "normal"),
+        "metadata": metadata,
+        "device_type": "usb",
+    }
 
-    The monitor orchestration and queue fan-in behavior are intentionally
-    preserved from the previous dispatcher implementation.
-    """
+
+def _normalize_process(process: dict) -> dict:
+    cpu = process.get("cpu")
+    if cpu is None:
+        cpu = process.get("cpu_percent")
+
+    memory = process.get("memory")
+    if memory is None:
+        memory = process.get("memory_mb")
+
+    name = process.get("name")
+    if not name:
+        name = process.get("process_name")
+
+    return {
+        "pid": process.get("pid"),
+        "name": name,
+        "label": process.get("label"),
+        "cpu": cpu,
+        "memory": memory,
+        "status": process.get("status") or "running",
+        "risk_level": process.get("risk_level"),
+    }
+
+
+def _normalize_terminal(event: dict, event_type: str, ts: Optional[float]) -> dict:
+    detected_at = event.get("detected_at") or event.get("ts")
+    if not detected_at:
+        if ts is not None:
+            detected_at = datetime.utcfromtimestamp(float(ts)).isoformat() + "Z"
+        else:
+            detected_at = datetime.utcnow().isoformat() + "Z"
+
+    return {
+        "id": event.get("id"),
+        "event_type": event.get("event_type") or event_type,
+        "tool": event.get("tool") or "unknown",
+        "detected_at": str(detected_at),
+        "pid": event.get("pid"),
+        "full_command": event.get("full_command"),
+        "remote_ip": event.get("remote_ip"),
+        "remote_port": str(event.get("remote_port")) if event.get("remote_port") is not None else None,
+        "remote_host": event.get("remote_host"),
+        "message": event.get("message"),
+        "risk_level": event.get("risk_level") or "normal",
+    }
+
+
+def _normalize_browser_entry(entry: dict) -> dict:
+    last_visited = entry.get("last_visited")
+    if last_visited is None:
+        last_visited = entry.get("last_visit")
+
+    try:
+        if last_visited is not None:
+            last_visited = float(last_visited)
+            if last_visited > 1e10:
+                last_visited = last_visited / 1000.0
+    except (TypeError, ValueError):
+        last_visited = None
+
+    try:
+        visit_count = int(entry.get("visit_count") or 1)
+    except (TypeError, ValueError):
+        visit_count = 1
+
+    return {
+        "url": entry.get("url"),
+        "title": entry.get("title"),
+        "visit_count": visit_count,
+        "last_visited": last_visited,
+        "browser": entry.get("browser"),
+    }
+
+
+async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[asyncio.Event] = None):
+    """Start all monitors and persist event stream to local DB."""
 
     if stop_event is None:
         stop_event = asyncio.Event()
 
-    # Keep a local queue so monitors never block on the network
     _queue: asyncio.Queue = asyncio.Queue(maxsize=4096)
 
     async def enqueue(event: dict):
-        """Callback given to each monitor."""
         if _queue.full():
             try:
-                _queue.get_nowait()   # drop oldest
+                _queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
         await _queue.put(event)
 
     async def drain():
-        """Forward events from local queue to explicit db handlers."""
         while True:
             evt = await _queue.get()
             event_type = evt.get("type")
@@ -41,89 +122,124 @@ async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[a
             ts = evt.get("ts")
             meta = evt.get("meta") or {}
 
-            if event_type in {"process_new", "process_update"} and isinstance(data, dict):
-                if meta.get("risk_level") is not None and data.get("risk_level") is None:
-                    data["risk_level"] = meta.get("risk_level")
-                if meta.get("category") is not None and data.get("category") is None:
-                    data["category"] = meta.get("category")
+            if event_type == "devices_snapshot" and isinstance(data, dict):
+                usb_devices = []
+                for raw in data.get("usb", []) or []:
+                    if not isinstance(raw, dict):
+                        continue
+                    normalized = _normalize_device(raw)
+                    if normalized.get("id"):
+                        usb_devices.append(normalized)
+                db.replace_devices(session_id, roll_no, usb_devices)
 
-            if event_type == "device_connected" and isinstance(data, dict):
-                if meta.get("risk_level") is not None and data.get("risk_level") is None:
-                    data["risk_level"] = meta.get("risk_level")
-                if meta.get("message") is not None and data.get("message") is None:
-                    data["message"] = meta.get("message")
+            elif event_type == "device_connected" and isinstance(data, dict):
+                device_type = str(data.get("type") or data.get("device_type") or "").lower()
+                if device_type == "usb":
+                    normalized = _normalize_device(data)
+                    if meta.get("risk_level") is not None and normalized.get("risk_level") is None:
+                        normalized["risk_level"] = meta.get("risk_level")
+                    if meta.get("message") is not None and normalized.get("message") is None:
+                        normalized["message"] = meta.get("message")
+                    if normalized.get("id"):
+                        db.upsert_device(session_id, roll_no, normalized)
 
-            if event_type in {"terminal_request", "terminal_command"} and isinstance(data, dict):
-                if meta.get("risk_level") is not None and data.get("risk_level") is None:
-                    data["risk_level"] = meta.get("risk_level")
-                if meta.get("message") is not None and data.get("message") is None:
-                    data["message"] = meta.get("message")
+            elif event_type == "device_disconnected" and isinstance(data, dict):
+                device_id = data.get("id") or data.get("device_id")
+                if device_id:
+                    db.remove_device(session_id, roll_no, str(device_id))
 
-            if event_type == "process_snapshot":
-                db.insert_processes(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "process_new":
-                db.insert_processes(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "process_update":
-                db.insert_processes(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "process_end":
-                db.insert_processes(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "devices_snapshot":
-                db.insert_devices(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "device_connected":
-                db.insert_devices(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "device_disconnected":
-                db.insert_devices(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "network_snapshot":
-                db.insert_network(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "network_update":
-                db.insert_network(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "domain_activity":
-                db.insert_domain_activity(session_id, roll_no, lab_no, data, ts)
-            elif event_type == "terminal_request":
-                db.insert_terminal_event(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "terminal_command":
-                db.insert_terminal_event(session_id, roll_no, lab_no, event_type, data, ts)
-            elif event_type == "browser_history":
-                db.insert_browser_history(session_id, roll_no, lab_no, data, ts)
+            elif event_type == "browser_history" and isinstance(data, list):
+                for raw in data:
+                    if not isinstance(raw, dict):
+                        continue
+                    normalized = _normalize_browser_entry(raw)
+                    if normalized.get("url"):
+                        db.upsert_browser_history(session_id, roll_no, normalized)
+
+            elif event_type == "process_snapshot" and isinstance(data, list):
+                filtered = []
+                for raw in data:
+                    if not isinstance(raw, dict):
+                        continue
+                    normalized = _normalize_process(raw)
+                    risk = str(normalized.get("risk_level") or "").lower()
+                    if risk in {"high", "medium"}:
+                        filtered.append(normalized)
+                db.replace_processes(session_id, roll_no, filtered)
+
+            elif event_type == "process_new" and isinstance(data, dict):
+                merged = dict(data)
+                if meta.get("risk_level") is not None and merged.get("risk_level") is None:
+                    merged["risk_level"] = meta.get("risk_level")
+                if meta.get("category") is not None and merged.get("category") is None:
+                    merged["category"] = meta.get("category")
+
+                normalized = _normalize_process(merged)
+                risk = str(normalized.get("risk_level") or "").lower()
+                if risk in {"high", "medium"}:
+                    db.upsert_process(session_id, roll_no, normalized)
+
+            elif event_type == "process_update" and isinstance(data, dict):
+                merged = dict(data)
+                if meta.get("risk_level") is not None and merged.get("risk_level") is None:
+                    merged["risk_level"] = meta.get("risk_level")
+                if meta.get("category") is not None and merged.get("category") is None:
+                    merged["category"] = meta.get("category")
+                db.update_process(session_id, roll_no, _normalize_process(merged))
+
+            elif event_type == "process_end" and isinstance(data, dict):
+                if data.get("pid") is not None:
+                    db.delete_process(session_id, roll_no, data.get("pid"))
+
+            elif event_type in {"terminal_request", "terminal_command"} and isinstance(data, dict):
+                merged = dict(data)
+                if meta.get("risk_level") is not None and merged.get("risk_level") is None:
+                    merged["risk_level"] = meta.get("risk_level")
+                if meta.get("message") is not None and merged.get("message") is None:
+                    merged["message"] = meta.get("message")
+                normalized = _normalize_terminal(merged, event_type, ts)
+                db.insert_terminal_event(session_id, roll_no, normalized)
+
+            elif event_type == "terminal_events_snapshot" and isinstance(data, list):
+                events = []
+                for raw in data:
+                    if not isinstance(raw, dict):
+                        continue
+                    raw_type = raw.get("event_type") or "terminal_command"
+                    events.append(_normalize_terminal(raw, raw_type, ts))
+                db.replace_terminal_events(session_id, roll_no, events)
+
             else:
-                log.warning("Unrecognized event type dropped: %s", event_type)
+                print(f"[dispatcher] Unrecognized event type: {event_type}")
 
     async def browser_history_monitor(send_fn):
         """Monitor browser history for visited URLs."""
-        import time
-        
-        # Initialize the agent start time - only track URLs from this point forward
         browser_history.initialize_agent_start_time()
         log.info("Browser history monitor started")
-        
+
         while True:
             try:
                 new_urls = browser_history.get_new_history()
                 if new_urls:
-                    log.info("Persisting %d browser history URLs", len(new_urls))
-                    # Send as browser_history event
-                    await send_fn({
-                        "type": "browser_history",
-                        "data": new_urls,
-                        "ts": time.time(),
-                        "meta": {
-                            "risk_level": "normal",
-                            "category": "browser",
-                            "message": f"{len(new_urls)} URL(s) visited during session",
-                        },
-                    })
-                else:
-                    log.debug("No browser history URLs found since agent started")
-            except Exception as e:
-                log.error(f"Browser history scan error: {e}", exc_info=True)
-            
-            # Scan every 10 seconds
+                    await send_fn(
+                        {
+                            "type": "browser_history",
+                            "data": new_urls,
+                            "ts": time.time(),
+                            "meta": {
+                                "risk_level": "normal",
+                                "category": "browser",
+                                "message": f"{len(new_urls)} URL(s) visited during session",
+                            },
+                        }
+                    )
+            except Exception as exc:
+                log.error("Browser history scan error: %s", exc, exc_info=True)
             await asyncio.sleep(10)
 
     async def stop_waiter():
         await stop_event.wait()
 
-    # Launch all concurrently
     tasks = [
         asyncio.create_task(process_monitor.run(enqueue), name="proc"),
         asyncio.create_task(device_monitor.run(enqueue), name="dev"),
@@ -134,15 +250,14 @@ async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[a
     ]
 
     try:
-        # If any task raises or finishes, cancel the rest
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for t in done:
-            if t.exception():
-                log.error("Task %s failed: %s", t.get_name(), t.exception())
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task.exception():
+                log.error("Task %s failed: %s", task.get_name(), task.exception())
     except asyncio.CancelledError:
         log.info("Dispatcher cancelled")
     finally:
-        for t in tasks:
-            t.cancel()
+        for task in tasks:
+            task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         log.info("All monitor tasks stopped")
