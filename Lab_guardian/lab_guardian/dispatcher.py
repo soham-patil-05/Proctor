@@ -33,10 +33,60 @@ async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[a
         await _queue.put(event)
 
     async def drain():
-        """Forward events from local queue -> db.insert_event()."""
+        """Forward events from local queue to explicit db handlers."""
         while True:
             evt = await _queue.get()
-            db.insert_event(session_id, roll_no, lab_no, evt)
+            event_type = evt.get("type")
+            data = evt.get("data")
+            ts = evt.get("ts")
+            meta = evt.get("meta") or {}
+
+            if event_type in {"process_new", "process_update"} and isinstance(data, dict):
+                if meta.get("risk_level") is not None and data.get("risk_level") is None:
+                    data["risk_level"] = meta.get("risk_level")
+                if meta.get("category") is not None and data.get("category") is None:
+                    data["category"] = meta.get("category")
+
+            if event_type == "device_connected" and isinstance(data, dict):
+                if meta.get("risk_level") is not None and data.get("risk_level") is None:
+                    data["risk_level"] = meta.get("risk_level")
+                if meta.get("message") is not None and data.get("message") is None:
+                    data["message"] = meta.get("message")
+
+            if event_type in {"terminal_request", "terminal_command"} and isinstance(data, dict):
+                if meta.get("risk_level") is not None and data.get("risk_level") is None:
+                    data["risk_level"] = meta.get("risk_level")
+                if meta.get("message") is not None and data.get("message") is None:
+                    data["message"] = meta.get("message")
+
+            if event_type == "process_snapshot":
+                db.insert_processes(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "process_new":
+                db.insert_processes(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "process_update":
+                db.insert_processes(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "process_end":
+                db.insert_processes(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "devices_snapshot":
+                db.insert_devices(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "device_connected":
+                db.insert_devices(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "device_disconnected":
+                db.insert_devices(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "network_snapshot":
+                db.insert_network(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "network_update":
+                db.insert_network(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "domain_activity":
+                db.insert_domain_activity(session_id, roll_no, lab_no, data, ts)
+            elif event_type == "terminal_request":
+                db.insert_terminal_event(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "terminal_command":
+                db.insert_terminal_event(session_id, roll_no, lab_no, event_type, data, ts)
+            elif event_type == "browser_history":
+                db.insert_browser_history(session_id, roll_no, lab_no, data, ts)
+            else:
+                log.warning("Unrecognized event type dropped: %s", event_type)
 
     async def browser_history_monitor(send_fn):
         """Monitor browser history for visited URLs."""

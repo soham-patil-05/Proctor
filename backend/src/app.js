@@ -11,6 +11,7 @@ app.disable('x-powered-by');
 
 /* ─── CORS configuration ───────────────────────────────────────── */
 app.use(cors());
+app.options('*', cors());
 
 app.use(express.json({ limit: '1mb' }));
 

@@ -1,4 +1,4 @@
-export default function StatusBadge({ status, className = '' }) {
+export default function StatusBadge({ status, variant, className = '' }) {
   const statusConfig = {
     normal: {
       color: 'bg-[var(--color-success)] text-white',
@@ -35,9 +35,40 @@ export default function StatusBadge({ status, className = '' }) {
       label: 'Inactive',
       dot: 'bg-[var(--color-gray-400)]'
     },
+    dangerous: {
+      color: 'bg-[#FDECEA] text-[#C62828]',
+      label: 'dangerous',
+      dot: 'bg-[#C62828]'
+    },
+    suspicious: {
+      color: 'bg-[#FFF8E1] text-[#F57F17]',
+      label: 'suspicious',
+      dot: 'bg-[#F57F17]'
+    },
+    safe: {
+      color: 'bg-[#E8F5E9] text-[#2E7D32]',
+      label: 'safe',
+      dot: 'bg-[#2E7D32]'
+    },
+    high: {
+      color: 'bg-[#FDECEA] text-[#C62828]',
+      label: 'high',
+      dot: 'bg-[#C62828]'
+    },
+    medium: {
+      color: 'bg-[#FFF8E1] text-[#F57F17]',
+      label: 'medium',
+      dot: 'bg-[#F57F17]'
+    },
+    low: {
+      color: 'bg-[#E8F5E9] text-[#2E7D32]',
+      label: 'low',
+      dot: 'bg-[#2E7D32]'
+    },
   };
 
-  const config = statusConfig[status] || statusConfig.normal;
+  const key = variant || status;
+  const config = statusConfig[key] || statusConfig.normal;
 
   return (
     <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium ${config.color} ${className}`}>

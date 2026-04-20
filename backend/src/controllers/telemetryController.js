@@ -1,9 +1,6 @@
 import { v5 as uuidv5, validate as uuidValidate } from 'uuid';
 import { query } from '../db/index.js';
-import { upsertProcessSnapshot } from '../services/processService.js';
-import { upsertDevicesSnapshot, upsertNetworkInfo, getDevices, getNetworkInfo } from '../services/deviceService.js';
-import { upsertDomainActivity, insertTerminalEvent, getDomainActivity, getTerminalEvents } from '../services/networkService.js';
-import { getProcesses } from '../services/processService.js';
+import { toCamel } from '../utils/helpers.js';
 
 const SESSION_NAMESPACE = '2ffce69a-b3c9-4d84-a6f7-a67dd6a958cc';
 
@@ -11,6 +8,23 @@ function normalizeSessionId(sessionId) {
   if (!sessionId) return null;
   const s = String(sessionId).trim();
   return uuidValidate(s) ? s : uuidv5(s, SESSION_NAMESPACE);
+}
+
+function toIsoOrNull(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function parseMaybeJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string') return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 async function ensureTeacherAndSubject() {
@@ -71,131 +85,256 @@ async function ensureSessionStudent(sessionId, studentId) {
 }
 
 /**
- * Ingest contract:
+ * EXPORT_PAYLOAD_SCHEMA:
  * {
- *   sessionId, rollNo, labNo, name, recordedAt,
- *   processes: [], devices: { usb: [], external: [] }, network: {},
- *   domainActivity: [], terminalEvents: [], browserHistory: []
+ *   "sessionId": string,
+ *   "rollNo": string,
+ *   "labNo": string,
+ *   "name": string,
+ *   "processes": [ { pid, process_name, cpu_percent, memory_mb, status, risk_level, category } ],
+ *   "devices": [ { device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message } ],
+ *   "network": { ip_address, gateway, dns, active_connections: [...] },
+ *   "domainActivity": [ { domain, request_count, risk_level, last_accessed } ],
+ *   "terminalEvents": [ { event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at } ],
+ *   "browserHistory": [ { url, title, visit_count, last_visit } ]
  * }
  */
-export async function ingestTelemetry(req, res, next) {
+export async function ingestTelemetry(req, res) {
+  const {
+    sessionId,
+    rollNo,
+    labNo,
+    name,
+    processes = [],
+    devices = [],
+    network = null,
+    domainActivity = [],
+    terminalEvents = [],
+    browserHistory = [],
+  } = req.body || {};
+
+  if (!sessionId || !rollNo) {
+    return res.status(400).json({ error: 'sessionId and rollNo are required' });
+  }
+
+  const stored = {
+    processes: 0,
+    devices: 0,
+    network: 0,
+    domainActivity: 0,
+    terminalEvents: 0,
+    browserHistory: 0,
+  };
+  const errors = [];
+
   try {
-    const {
-      sessionId,
-      rollNo,
-      labNo,
-      name,
-      processes = [],
-      devices = { usb: [], external: [] },
-      network = null,
-      domainActivity = [],
-      terminalEvents = [],
-      browserHistory = [],
-    } = req.body || {};
-
-    if (!sessionId || !rollNo) {
-      return res.status(400).json({ error: 'sessionId and rollNo are required' });
-    }
-
     const resolvedSessionId = await ensureSession(sessionId, labNo);
     const studentId = await ensureStudent(rollNo, name);
     await ensureSessionStudent(resolvedSessionId, studentId);
 
-    if (Array.isArray(processes) && processes.length > 0) {
-      const normalizedProcesses = processes.map((p) => ({
-        pid: p.pid,
-        name: p.name ?? p.processName,
-        cpu: p.cpu ?? p.cpuPercent,
-        memory: p.memory ?? p.memoryMb,
-        status: p.status,
-        risk_level: p.risk_level ?? p.riskLevel,
-        category: p.category,
-      }));
-      await upsertProcessSnapshot(resolvedSessionId, studentId, normalizedProcesses);
-    }
-
-    if (devices && (Array.isArray(devices.usb) || Array.isArray(devices.external))) {
-      const normalizedDevices = {
-        usb: (devices.usb || []).map((d) => ({
-          id: d.id ?? d.deviceId,
-          name: d.name ?? d.deviceName,
-          metadata: d.metadata ?? null,
-          readable_name: d.readable_name ?? d.readableName,
-          risk_level: d.risk_level ?? d.riskLevel,
-          message: d.message ?? null,
-        })),
-        external: (devices.external || []).map((d) => ({
-          id: d.id ?? d.deviceId,
-          name: d.name ?? d.deviceName,
-          metadata: d.metadata ?? null,
-          readable_name: d.readable_name ?? d.readableName,
-          risk_level: d.risk_level ?? d.riskLevel,
-          message: d.message ?? null,
-        })),
-      };
-      await upsertDevicesSnapshot(resolvedSessionId, studentId, normalizedDevices);
-    }
-
-    if (network && typeof network === 'object') {
-      await upsertNetworkInfo(resolvedSessionId, studentId, {
-        ip: network.ip ?? network.ipAddress,
-        gateway: network.gateway,
-        dns: network.dns,
-        activeConnections: network.activeConnections,
-      });
-    }
-
-    if (Array.isArray(domainActivity) && domainActivity.length > 0) {
-      const normalizedDomains = domainActivity.map((d) => ({
-        domain: d.domain,
-        count: d.count ?? d.requestCount,
-        risk_level: d.risk_level ?? d.riskLevel,
-      }));
-      await upsertDomainActivity(resolvedSessionId, studentId, normalizedDomains);
-    }
-
-    if (Array.isArray(terminalEvents)) {
-      for (const event of terminalEvents) {
-        const eventType = event.eventType ?? event.event_type ?? 'terminal_command';
-        await insertTerminalEvent(
-          resolvedSessionId,
-          studentId,
-          {
-            tool: event.tool,
-            remote_ip: event.remoteIp ?? event.remote_ip,
-            remote_host: event.remoteHost ?? event.remote_host,
-            remote_port: event.remotePort ?? event.remote_port,
-            pid: event.pid,
-            full_command: event.fullCommand ?? event.full_command,
-          },
-          eventType,
-          event.riskLevel ?? event.risk_level ?? 'medium',
-          event.message ?? null
-        );
-      }
-    }
-
-    if (Array.isArray(browserHistory)) {
-      for (const row of browserHistory) {
+    try {
+      if (Array.isArray(processes)) {
         await query(
-          `INSERT INTO browser_history
-           (session_id, student_id, url, title, visit_count, last_visit, synced, created_at, recorded_at)
-           VALUES ($1, $2, $3, $4, $5, $6, 1, now(), now())`,
+          `UPDATE live_processes
+           SET status = 'ended', updated_at = now()
+           WHERE session_id = $1 AND student_id = $2`,
+          [resolvedSessionId, studentId]
+        );
+
+        for (const p of processes) {
+          await query(
+            `INSERT INTO live_processes
+             (session_id, student_id, pid, process_name, cpu_percent, memory_mb, status, risk_level, category, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+             ON CONFLICT (session_id, student_id, pid)
+             DO UPDATE SET
+               process_name = EXCLUDED.process_name,
+               cpu_percent = EXCLUDED.cpu_percent,
+               memory_mb = EXCLUDED.memory_mb,
+               status = EXCLUDED.status,
+               risk_level = EXCLUDED.risk_level,
+               category = EXCLUDED.category,
+               updated_at = now()`,
+            [
+              resolvedSessionId,
+              studentId,
+              p.pid,
+              p.process_name,
+              p.cpu_percent ?? 0,
+              p.memory_mb ?? 0,
+              p.status ?? 'running',
+              p.risk_level ?? null,
+              p.category ?? null,
+            ]
+          );
+          stored.processes += 1;
+        }
+      }
+    } catch (err) {
+      console.error('[ingest/processes]', err);
+      errors.push(`processes: ${err.message}`);
+    }
+
+    try {
+      if (Array.isArray(devices)) {
+        for (const d of devices) {
+          await query(
+            `INSERT INTO connected_devices
+             (session_id, student_id, device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (session_id, student_id, device_id)
+             DO UPDATE SET
+               device_name = EXCLUDED.device_name,
+               device_type = EXCLUDED.device_type,
+               connected_at = COALESCE(EXCLUDED.connected_at, connected_devices.connected_at),
+               disconnected_at = EXCLUDED.disconnected_at,
+               readable_name = EXCLUDED.readable_name,
+               risk_level = EXCLUDED.risk_level,
+               message = EXCLUDED.message`,
+            [
+              resolvedSessionId,
+              studentId,
+              d.device_id,
+              d.device_name,
+              d.device_type,
+              toIsoOrNull(d.connected_at) ?? new Date().toISOString(),
+              toIsoOrNull(d.disconnected_at),
+              d.readable_name ?? null,
+              d.risk_level ?? null,
+              d.message ?? null,
+            ]
+          );
+          stored.devices += 1;
+        }
+      }
+    } catch (err) {
+      console.error('[ingest/devices]', err);
+      errors.push(`devices: ${err.message}`);
+    }
+
+    try {
+      if (network && typeof network === 'object') {
+        await query(
+          `INSERT INTO network_info
+           (session_id, student_id, ip_address, gateway, dns, active_connections, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, now())
+           ON CONFLICT (session_id, student_id)
+           DO UPDATE SET
+             ip_address = EXCLUDED.ip_address,
+             gateway = EXCLUDED.gateway,
+             dns = EXCLUDED.dns,
+             active_connections = EXCLUDED.active_connections,
+             updated_at = now()`,
           [
             resolvedSessionId,
             studentId,
-            row.url ?? null,
-            row.title ?? null,
-            row.visitCount ?? row.visit_count ?? 1,
-            row.lastVisit ?? row.last_visited ?? null,
+            network.ip_address ?? null,
+            network.gateway ?? null,
+            JSON.stringify(Array.isArray(network.dns) ? network.dns : []),
+            JSON.stringify(Array.isArray(network.active_connections) ? network.active_connections : []),
           ]
         );
+        stored.network += 1;
       }
+    } catch (err) {
+      console.error('[ingest/network]', err);
+      errors.push(`network: ${err.message}`);
     }
 
-    res.json({ success: true });
+    try {
+      if (Array.isArray(domainActivity)) {
+        for (const d of domainActivity) {
+          await query(
+            `INSERT INTO domain_activity
+             (id, session_id, student_id, domain, request_count, risk_level, last_accessed)
+             VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, $6)
+             ON CONFLICT (session_id, student_id, domain)
+             DO UPDATE SET
+               request_count = domain_activity.request_count + EXCLUDED.request_count,
+               risk_level = EXCLUDED.risk_level,
+               last_accessed = EXCLUDED.last_accessed`,
+            [
+              resolvedSessionId,
+              studentId,
+              d.domain,
+              d.request_count ?? 1,
+              d.risk_level ?? null,
+              toIsoOrNull(d.last_accessed) ?? new Date().toISOString(),
+            ]
+          );
+          stored.domainActivity += 1;
+        }
+      }
+    } catch (err) {
+      console.error('[ingest/domainActivity]', err);
+      errors.push(`domainActivity: ${err.message}`);
+    }
+
+    try {
+      if (Array.isArray(terminalEvents)) {
+        for (const t of terminalEvents) {
+          await query(
+            `INSERT INTO terminal_events
+             (id, session_id, student_id, event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at)
+             VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            [
+              resolvedSessionId,
+              studentId,
+              t.event_type,
+              t.tool ?? null,
+              t.remote_ip ?? null,
+              t.remote_host ?? null,
+              t.remote_port ?? null,
+              t.pid ?? null,
+              t.full_command ?? null,
+              t.risk_level ?? null,
+              t.message ?? null,
+              toIsoOrNull(t.detected_at) ?? new Date().toISOString(),
+            ]
+          );
+          stored.terminalEvents += 1;
+        }
+      }
+    } catch (err) {
+      console.error('[ingest/terminalEvents]', err);
+      errors.push(`terminalEvents: ${err.message}`);
+    }
+
+    try {
+      if (Array.isArray(browserHistory)) {
+        for (const b of browserHistory) {
+          await query(
+            `INSERT INTO browser_history
+             (session_id, student_id, url, title, visit_count, last_visit, synced, created_at, recorded_at)
+             VALUES ($1, $2, $3, $4, $5, $6, true, now(), now())`,
+            [
+              resolvedSessionId,
+              studentId,
+              b.url ?? null,
+              b.title ?? null,
+              b.visit_count ?? 1,
+              toIsoOrNull(b.last_visit) ?? new Date().toISOString(),
+            ]
+          );
+          stored.browserHistory += 1;
+        }
+      }
+    } catch (err) {
+      console.error('[ingest/browserHistory]', err);
+      errors.push(`browserHistory: ${err.message}`);
+    }
+
+    if (errors.length > 0) {
+      return res.status(500).json({
+        error: 'Storage failure',
+        detail: errors.join(' | '),
+        stored,
+      });
+    }
+
+    return res.json({ success: true, stored });
   } catch (err) {
-    next(err);
+    return res.status(500).json({ error: 'Storage failure', detail: err.message });
   }
 }
 
@@ -259,7 +398,6 @@ export async function queryTelemetry(req, res, next) {
       filtered = filtered.filter((r) => new Date(r.lastRecordedAt).getTime() <= end);
     }
 
-    // If both bounds are purely numeric we compare numerically, otherwise lexicographically.
     const bothNumeric =
       rollNoStart !== undefined &&
       rollNoEnd !== undefined &&
@@ -316,84 +454,152 @@ export async function getStudentDetail(req, res, next) {
 
     const studentId = studentRes.rows[0].id;
 
-    const [processes, devices, network, domainActivity, terminalEvents, browserRows] = await Promise.all([
-      getProcesses(resolvedSessionId, studentId),
-      getDevices(resolvedSessionId, studentId),
-      getNetworkInfo(resolvedSessionId, studentId),
-      getDomainActivity(resolvedSessionId, studentId),
-      getTerminalEvents(resolvedSessionId, studentId),
+    const [processRows, deviceRows, networkRows, domainRows, terminalRows, browserRows] = await Promise.all([
+      query(
+        `SELECT pid, process_name, cpu_percent, memory_mb, status, risk_level, category
+         FROM live_processes
+         WHERE session_id = $1 AND student_id = $2
+         ORDER BY updated_at DESC`,
+        [resolvedSessionId, studentId]
+      ),
+      query(
+        `SELECT device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message
+         FROM connected_devices
+         WHERE session_id = $1 AND student_id = $2
+         ORDER BY connected_at DESC`,
+        [resolvedSessionId, studentId]
+      ),
+      query(
+        `SELECT ip_address, gateway, dns, active_connections
+         FROM network_info
+         WHERE session_id = $1 AND student_id = $2
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        [resolvedSessionId, studentId]
+      ),
+      query(
+        `SELECT domain, request_count, risk_level, last_accessed
+         FROM domain_activity
+         WHERE session_id = $1 AND student_id = $2
+         ORDER BY request_count DESC`,
+        [resolvedSessionId, studentId]
+      ),
+      query(
+        `SELECT event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at
+         FROM terminal_events
+         WHERE session_id = $1 AND student_id = $2
+         ORDER BY detected_at DESC
+         LIMIT 200`,
+        [resolvedSessionId, studentId]
+      ),
       query(
         `SELECT url, title, visit_count, last_visit
          FROM browser_history
          WHERE session_id = $1 AND student_id = $2
-         ORDER BY created_at DESC
+         ORDER BY last_visit DESC
          LIMIT 500`,
         [resolvedSessionId, studentId]
       ),
     ]);
 
+    const processes = processRows.rows.map((r) => {
+      const c = toCamel(r);
+      return {
+        pid: c.pid,
+        processName: c.processName,
+        cpuPercent: Number(c.cpuPercent ?? 0),
+        memoryMb: Number(c.memoryMb ?? 0),
+        status: c.status,
+        riskLevel: c.riskLevel ?? null,
+        category: c.category ?? null,
+      };
+    });
+
+    const allDevices = deviceRows.rows.map((r) => {
+      const c = toCamel(r);
+      return {
+        deviceId: c.deviceId,
+        deviceName: c.deviceName,
+        deviceType: c.deviceType,
+        connectedAt: c.connectedAt,
+        disconnectedAt: c.disconnectedAt,
+        readableName: c.readableName,
+        riskLevel: c.riskLevel,
+        message: c.message,
+      };
+    });
+
+    const network = networkRows.rows[0]
+      ? (() => {
+          const c = toCamel(networkRows.rows[0]);
+          const dns = parseMaybeJsonArray(c.dns);
+          const active = parseMaybeJsonArray(c.activeConnections).map((row) => {
+            const rc = toCamel(row);
+            return {
+              remoteIp: rc.remoteIp,
+              remoteHost: rc.remoteHost,
+              remotePort: rc.remotePort,
+              pid: rc.pid,
+              process: rc.process,
+            };
+          });
+          return {
+            ipAddress: c.ipAddress,
+            gateway: c.gateway,
+            dns,
+            activeConnections: active,
+          };
+        })()
+      : null;
+
+    const domainActivity = domainRows.rows.map((r) => {
+      const c = toCamel(r);
+      return {
+        domain: c.domain,
+        requestCount: c.requestCount,
+        riskLevel: c.riskLevel,
+        lastAccessed: c.lastAccessed,
+      };
+    });
+
+    const terminalEvents = terminalRows.rows.map((r) => {
+      const c = toCamel(r);
+      return {
+        eventType: c.eventType,
+        tool: c.tool,
+        remoteIp: c.remoteIp,
+        remoteHost: c.remoteHost,
+        remotePort: c.remotePort,
+        pid: c.pid,
+        fullCommand: c.fullCommand,
+        riskLevel: c.riskLevel,
+        message: c.message,
+        detectedAt: c.detectedAt,
+      };
+    });
+
+    const browserHistory = browserRows.rows.map((r) => {
+      const c = toCamel(r);
+      return {
+        url: c.url,
+        title: c.title,
+        visitCount: c.visitCount,
+        lastVisit: c.lastVisit,
+      };
+    });
+
     res.json({
       rollNo,
       sessionId: resolvedSessionId,
-      processes: processes.map((p) => ({
-        pid: p.pid,
-        processName: p.name,
-        cpuPercent: Number(p.cpu ?? 0),
-        memoryMb: Number(p.memory ?? 0),
-        status: p.status,
-        riskLevel: p.risk_level ?? null,
-        category: p.category ?? null,
-      })),
+      processes,
       devices: {
-        usb: (devices.usb || []).map((d) => ({
-          deviceId: d.id,
-          deviceName: d.name,
-          readableName: d.readable_name ?? null,
-          riskLevel: d.risk_level ?? null,
-          message: d.message ?? null,
-          metadata: d.metadata ?? null,
-        })),
-        external: (devices.external || []).map((d) => ({
-          deviceId: d.id,
-          deviceName: d.name,
-          readableName: d.readable_name ?? null,
-          riskLevel: d.risk_level ?? null,
-          message: d.message ?? null,
-          metadata: d.metadata ?? null,
-        })),
+        usb: allDevices.filter((d) => (d.deviceType || '').toLowerCase() === 'usb'),
+        external: allDevices.filter((d) => (d.deviceType || '').toLowerCase() !== 'usb'),
       },
-      network: network
-        ? {
-            ipAddress: network.ip,
-            gateway: network.gateway,
-            dns: network.dns,
-            activeConnections: network.activeConnections,
-          }
-        : null,
-      domainActivity: domainActivity.map((d) => ({
-        domain: d.domain,
-        requestCount: d.request_count,
-        riskLevel: d.risk_level,
-        lastAccessed: d.last_accessed,
-      })),
-      terminalEvents: terminalEvents.map((t) => ({
-        eventType: t.event_type,
-        tool: t.tool,
-        fullCommand: t.full_command,
-        remoteIp: t.remote_ip,
-        remoteHost: t.remote_host,
-        remotePort: t.remote_port,
-        pid: t.pid,
-        riskLevel: t.risk_level,
-        message: t.message,
-        detectedAt: t.detected_at,
-      })),
-      browserHistory: browserRows.rows.map((b) => ({
-        url: b.url,
-        title: b.title,
-        visitCount: b.visit_count,
-        lastVisit: b.last_visit,
-      })),
+      network,
+      domainActivity,
+      terminalEvents,
+      browserHistory,
     });
   } catch (err) {
     next(err);

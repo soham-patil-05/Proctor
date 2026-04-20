@@ -1,18 +1,17 @@
 """Local SQLite persistence for Lab Guardian.
 
-Export payload contract used by GUI -> backend ingest:
+EXPORT_PAYLOAD_SCHEMA:
 {
-  sessionId,
-  rollNo,
-  labNo,
-  name,
-  recordedAt,
-  processes: [...],
-  devices: { usb: [...], external: [...] },
-  network: {...} | null,
-  domainActivity: [...],
-  terminalEvents: [...],
-  browserHistory: [...]
+  "sessionId": string,
+  "rollNo": string,
+  "labNo": string,
+  "name": string,
+  "processes": [ { pid, process_name, cpu_percent, memory_mb, status, risk_level, category } ],
+  "devices": [ { device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message } ],
+  "network": { ip_address, gateway, dns, active_connections: [...] } | null,
+  "domainActivity": [ { domain, request_count, risk_level, last_accessed } ],
+  "terminalEvents": [ { event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at } ],
+  "browserHistory": [ { url, title, visit_count, last_visit } ]
 }
 """
 
@@ -32,6 +31,15 @@ _DB_PATH = os.environ.get("LG_LOCAL_DB_PATH", os.path.abspath("labguardian_local
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _to_recorded_at(ts: Optional[float]) -> str:
+    if ts is None:
+        return _now_iso()
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        return _now_iso()
 
 
 def _connect() -> sqlite3.Connection:
@@ -58,53 +66,68 @@ def init_db(db_path: Optional[str] = None) -> None:
                 name TEXT,
                 lab_no TEXT NOT NULL,
                 started_at TEXT NOT NULL,
-                ended_at TEXT,
-                synced INTEGER DEFAULT 0
+                ended_at TEXT
             )
             """
         )
 
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS processes (
+            CREATE TABLE IF NOT EXISTS live_processes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 roll_no TEXT NOT NULL,
                 lab_no TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                process_name TEXT,
+                cpu_percent REAL,
+                memory_mb REAL,
+                status TEXT,
+                risk_level TEXT,
+                category TEXT,
                 recorded_at TEXT NOT NULL,
-                synced INTEGER DEFAULT 0
+                synced INTEGER DEFAULT 0,
+                UNIQUE(session_id, roll_no, pid)
             )
             """
         )
 
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS devices (
+            CREATE TABLE IF NOT EXISTS connected_devices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 roll_no TEXT NOT NULL,
                 lab_no TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                device_name TEXT,
+                device_type TEXT,
+                connected_at TEXT,
+                disconnected_at TEXT,
+                readable_name TEXT,
+                risk_level TEXT,
+                message TEXT,
                 recorded_at TEXT NOT NULL,
-                synced INTEGER DEFAULT 0
+                synced INTEGER DEFAULT 0,
+                UNIQUE(session_id, roll_no, device_id)
             )
             """
         )
 
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS network_snapshots (
+            CREATE TABLE IF NOT EXISTS network_info (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 roll_no TEXT NOT NULL,
                 lab_no TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
+                ip_address TEXT,
+                gateway TEXT,
+                dns TEXT,
+                active_connections TEXT,
                 recorded_at TEXT NOT NULL,
-                synced INTEGER DEFAULT 0
+                synced INTEGER DEFAULT 0,
+                UNIQUE(session_id, roll_no)
             )
             """
         )
@@ -116,9 +139,12 @@ def init_db(db_path: Optional[str] = None) -> None:
                 session_id TEXT NOT NULL,
                 roll_no TEXT NOT NULL,
                 lab_no TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                recorded_at TEXT NOT NULL,
-                synced INTEGER DEFAULT 0
+                domain TEXT NOT NULL,
+                request_count INTEGER DEFAULT 0,
+                risk_level TEXT,
+                last_accessed TEXT,
+                synced INTEGER DEFAULT 0,
+                UNIQUE(session_id, roll_no, domain)
             )
             """
         )
@@ -130,9 +156,16 @@ def init_db(db_path: Optional[str] = None) -> None:
                 session_id TEXT NOT NULL,
                 roll_no TEXT NOT NULL,
                 lab_no TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                recorded_at TEXT NOT NULL,
+                event_type TEXT,
+                tool TEXT,
+                remote_ip TEXT,
+                remote_host TEXT,
+                remote_port INTEGER,
+                pid INTEGER,
+                full_command TEXT,
+                risk_level TEXT,
+                message TEXT,
+                detected_at TEXT,
                 synced INTEGER DEFAULT 0
             )
             """
@@ -145,8 +178,10 @@ def init_db(db_path: Optional[str] = None) -> None:
                 session_id TEXT NOT NULL,
                 roll_no TEXT NOT NULL,
                 lab_no TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                recorded_at TEXT NOT NULL,
+                url TEXT,
+                title TEXT,
+                visit_count INTEGER DEFAULT 1,
+                last_visit TEXT,
                 synced INTEGER DEFAULT 0
             )
             """
@@ -185,206 +220,506 @@ def end_session(session_id: str, roll_no: str) -> None:
         conn.close()
 
 
-def _insert_generic(
-    table: str,
-    session_id: str,
-    roll_no: str,
-    lab_no: str,
-    payload: Any,
-    event_type: Optional[str] = None,
-    recorded_at: Optional[str] = None,
-) -> None:
-    recorded_at = recorded_at or _now_iso()
-    payload_text = json.dumps(payload, ensure_ascii=True)
+def insert_processes(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, ts: Optional[float] = None) -> None:
+    recorded_at = _to_recorded_at(ts)
+    with _DB_LOCK:
+        conn = _connect()
+
+        if event_type == "process_snapshot":
+            conn.execute(
+                """
+                UPDATE live_processes
+                SET status = 'ended', recorded_at = ?, synced = 0
+                WHERE session_id = ? AND roll_no = ?
+                """,
+                (recorded_at, session_id, roll_no),
+            )
+
+            for proc in data or []:
+                conn.execute(
+                    """
+                    INSERT INTO live_processes
+                    (session_id, roll_no, lab_no, pid, process_name, cpu_percent, memory_mb, status, risk_level, category, recorded_at, synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ON CONFLICT(session_id, roll_no, pid)
+                    DO UPDATE SET
+                        process_name = excluded.process_name,
+                        cpu_percent = excluded.cpu_percent,
+                        memory_mb = excluded.memory_mb,
+                        status = excluded.status,
+                        risk_level = excluded.risk_level,
+                        category = excluded.category,
+                        recorded_at = excluded.recorded_at,
+                        synced = 0,
+                        lab_no = excluded.lab_no
+                    """,
+                    (
+                        session_id,
+                        roll_no,
+                        lab_no,
+                        proc.get("pid"),
+                        proc.get("name") or proc.get("process_name"),
+                        proc.get("cpu") if proc.get("cpu") is not None else proc.get("cpu_percent"),
+                        proc.get("memory") if proc.get("memory") is not None else proc.get("memory_mb"),
+                        proc.get("status") or "running",
+                        proc.get("risk_level"),
+                        proc.get("category"),
+                        recorded_at,
+                    ),
+                )
+
+        elif event_type in {"process_new", "process_update"} and isinstance(data, dict):
+            conn.execute(
+                """
+                INSERT INTO live_processes
+                (session_id, roll_no, lab_no, pid, process_name, cpu_percent, memory_mb, status, risk_level, category, recorded_at, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(session_id, roll_no, pid)
+                DO UPDATE SET
+                    process_name = excluded.process_name,
+                    cpu_percent = excluded.cpu_percent,
+                    memory_mb = excluded.memory_mb,
+                    status = excluded.status,
+                    risk_level = excluded.risk_level,
+                    category = excluded.category,
+                    recorded_at = excluded.recorded_at,
+                    synced = 0,
+                    lab_no = excluded.lab_no
+                """,
+                (
+                    session_id,
+                    roll_no,
+                    lab_no,
+                    data.get("pid"),
+                    data.get("name") or data.get("process_name"),
+                    data.get("cpu") if data.get("cpu") is not None else data.get("cpu_percent"),
+                    data.get("memory") if data.get("memory") is not None else data.get("memory_mb"),
+                    data.get("status") or "running",
+                    data.get("risk_level"),
+                    data.get("category"),
+                    recorded_at,
+                ),
+            )
+
+        elif event_type == "process_end" and isinstance(data, dict):
+            conn.execute(
+                """
+                UPDATE live_processes
+                SET status = 'ended', recorded_at = ?, synced = 0
+                WHERE session_id = ? AND roll_no = ? AND pid = ?
+                """,
+                (recorded_at, session_id, roll_no, data.get("pid")),
+            )
+
+        conn.commit()
+        conn.close()
+
+
+def insert_devices(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, ts: Optional[float] = None) -> None:
+    recorded_at = _to_recorded_at(ts)
+    with _DB_LOCK:
+        conn = _connect()
+
+        if event_type == "devices_snapshot" and isinstance(data, dict):
+            snapshot_ids: set[str] = set()
+            for device_type in ("usb", "external"):
+                for d in data.get(device_type, []) or []:
+                    device_id = str(d.get("id") or d.get("device_id") or "")
+                    if not device_id:
+                        continue
+                    snapshot_ids.add(device_id)
+                    conn.execute(
+                        """
+                        INSERT INTO connected_devices
+                        (session_id, roll_no, lab_no, device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message, recorded_at, synced)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0)
+                        ON CONFLICT(session_id, roll_no, device_id)
+                        DO UPDATE SET
+                            device_name = excluded.device_name,
+                            device_type = excluded.device_type,
+                            connected_at = COALESCE(connected_devices.connected_at, excluded.connected_at),
+                            disconnected_at = NULL,
+                            readable_name = excluded.readable_name,
+                            risk_level = excluded.risk_level,
+                            message = excluded.message,
+                            recorded_at = excluded.recorded_at,
+                            synced = 0,
+                            lab_no = excluded.lab_no
+                        """,
+                        (
+                            session_id,
+                            roll_no,
+                            lab_no,
+                            device_id,
+                            d.get("name") or d.get("device_name"),
+                            device_type,
+                            recorded_at,
+                            d.get("readable_name"),
+                            d.get("risk_level"),
+                            d.get("message"),
+                            recorded_at,
+                        ),
+                    )
+
+            if snapshot_ids:
+                placeholders = ",".join(["?"] * len(snapshot_ids))
+                conn.execute(
+                    f"""
+                    UPDATE connected_devices
+                    SET disconnected_at = ?, recorded_at = ?, synced = 0
+                    WHERE session_id = ? AND roll_no = ? AND device_id NOT IN ({placeholders})
+                    """,
+                    (recorded_at, recorded_at, session_id, roll_no, *list(snapshot_ids)),
+                )
+
+        elif event_type == "device_connected" and isinstance(data, dict):
+            device_id = str(data.get("id") or data.get("device_id") or "")
+            if device_id:
+                device_type = data.get("type") or data.get("device_type") or "usb"
+                conn.execute(
+                    """
+                    INSERT INTO connected_devices
+                    (session_id, roll_no, lab_no, device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message, recorded_at, synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0)
+                    ON CONFLICT(session_id, roll_no, device_id)
+                    DO UPDATE SET
+                        device_name = excluded.device_name,
+                        device_type = excluded.device_type,
+                        connected_at = COALESCE(connected_devices.connected_at, excluded.connected_at),
+                        disconnected_at = NULL,
+                        readable_name = excluded.readable_name,
+                        risk_level = excluded.risk_level,
+                        message = excluded.message,
+                        recorded_at = excluded.recorded_at,
+                        synced = 0,
+                        lab_no = excluded.lab_no
+                    """,
+                    (
+                        session_id,
+                        roll_no,
+                        lab_no,
+                        device_id,
+                        data.get("name") or data.get("device_name"),
+                        device_type,
+                        recorded_at,
+                        data.get("readable_name"),
+                        data.get("risk_level"),
+                        data.get("message"),
+                        recorded_at,
+                    ),
+                )
+
+        elif event_type == "device_disconnected" and isinstance(data, dict):
+            device_id = str(data.get("id") or data.get("device_id") or "")
+            if device_id:
+                conn.execute(
+                    """
+                    UPDATE connected_devices
+                    SET disconnected_at = ?, recorded_at = ?, synced = 0
+                    WHERE session_id = ? AND roll_no = ? AND device_id = ?
+                    """,
+                    (recorded_at, recorded_at, session_id, roll_no, device_id),
+                )
+
+        conn.commit()
+        conn.close()
+
+
+def insert_network(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, ts: Optional[float] = None) -> None:
+    if event_type not in {"network_snapshot", "network_update"} or not isinstance(data, dict):
+        return
+
+    recorded_at = _to_recorded_at(ts)
+    active_connections = data.get("active_connections")
+    if active_connections is None:
+        active_connections = data.get("activeConnections")
+    if active_connections is None:
+        active_connections = []
 
     with _DB_LOCK:
         conn = _connect()
-        if event_type is None:
+        conn.execute(
+            """
+            INSERT INTO network_info
+            (session_id, roll_no, lab_no, ip_address, gateway, dns, active_connections, recorded_at, synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(session_id, roll_no)
+            DO UPDATE SET
+                ip_address = excluded.ip_address,
+                gateway = excluded.gateway,
+                dns = excluded.dns,
+                active_connections = excluded.active_connections,
+                recorded_at = excluded.recorded_at,
+                synced = 0,
+                lab_no = excluded.lab_no
+            """,
+            (
+                session_id,
+                roll_no,
+                lab_no,
+                data.get("ip") or data.get("ip_address"),
+                data.get("gateway"),
+                json.dumps(data.get("dns") or [], ensure_ascii=True),
+                json.dumps(active_connections, ensure_ascii=True),
+                recorded_at,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+
+def insert_domain_activity(session_id: str, roll_no: str, lab_no: str, data: Any, ts: Optional[float] = None) -> None:
+    recorded_at = _to_recorded_at(ts)
+    rows = data if isinstance(data, list) else []
+
+    with _DB_LOCK:
+        conn = _connect()
+        for item in rows:
+            domain = item.get("domain")
+            if not domain:
+                continue
+            count = item.get("count") if item.get("count") is not None else item.get("request_count")
+            count = int(count or 1)
             conn.execute(
-                f"INSERT INTO {table} (session_id, roll_no, lab_no, payload, recorded_at) VALUES (?, ?, ?, ?, ?)",
-                (session_id, roll_no, lab_no, payload_text, recorded_at),
-            )
-        else:
-            conn.execute(
-                f"INSERT INTO {table} (session_id, roll_no, lab_no, event_type, payload, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, roll_no, lab_no, event_type, payload_text, recorded_at),
+                """
+                INSERT INTO domain_activity
+                (session_id, roll_no, lab_no, domain, request_count, risk_level, last_accessed, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(session_id, roll_no, domain)
+                DO UPDATE SET
+                    request_count = domain_activity.request_count + excluded.request_count,
+                    risk_level = COALESCE(excluded.risk_level, domain_activity.risk_level),
+                    last_accessed = excluded.last_accessed,
+                    synced = 0,
+                    lab_no = excluded.lab_no
+                """,
+                (
+                    session_id,
+                    roll_no,
+                    lab_no,
+                    domain,
+                    count,
+                    item.get("risk_level"),
+                    recorded_at,
+                ),
             )
         conn.commit()
         conn.close()
 
 
-def insert_processes(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, recorded_at: Optional[str] = None) -> None:
-    _insert_generic("processes", session_id, roll_no, lab_no, data, event_type=event_type, recorded_at=recorded_at)
+def insert_terminal_event(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, ts: Optional[float] = None) -> None:
+    if not isinstance(data, dict):
+        return
+    detected_at = _to_recorded_at(ts)
 
-
-def insert_devices(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, recorded_at: Optional[str] = None) -> None:
-    _insert_generic("devices", session_id, roll_no, lab_no, data, event_type=event_type, recorded_at=recorded_at)
-
-
-def insert_network(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, recorded_at: Optional[str] = None) -> None:
-    _insert_generic("network_snapshots", session_id, roll_no, lab_no, data, event_type=event_type, recorded_at=recorded_at)
-
-
-def insert_domain_activity(session_id: str, roll_no: str, lab_no: str, data: Any, recorded_at: Optional[str] = None) -> None:
-    _insert_generic("domain_activity", session_id, roll_no, lab_no, data, event_type=None, recorded_at=recorded_at)
-
-
-def insert_terminal_event(session_id: str, roll_no: str, lab_no: str, event_type: str, data: Any, recorded_at: Optional[str] = None) -> None:
-    _insert_generic("terminal_events", session_id, roll_no, lab_no, data, event_type=event_type, recorded_at=recorded_at)
-
-
-def insert_browser_history(session_id: str, roll_no: str, lab_no: str, data: Any, recorded_at: Optional[str] = None) -> None:
-    _insert_generic("browser_history", session_id, roll_no, lab_no, data, event_type=None, recorded_at=recorded_at)
-
-
-def insert_event(session_id: str, roll_no: str, lab_no: str, event: dict) -> None:
-    event_type = event.get("type")
-    data = event.get("data")
-    ts = event.get("ts")
-    recorded_at = None
-    if ts:
-        try:
-            recorded_at = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-        except Exception:
-            recorded_at = _now_iso()
-
-    if event_type in {"process_snapshot", "process_new", "process_update", "process_end"}:
-        insert_processes(session_id, roll_no, lab_no, event_type, data, recorded_at)
-    elif event_type in {"devices_snapshot", "device_connected", "device_disconnected"}:
-        insert_devices(session_id, roll_no, lab_no, event_type, data, recorded_at)
-    elif event_type in {"network_snapshot", "network_update"}:
-        insert_network(session_id, roll_no, lab_no, event_type, data, recorded_at)
-    elif event_type == "domain_activity":
-        insert_domain_activity(session_id, roll_no, lab_no, data, recorded_at)
-    elif event_type in {"terminal_request", "terminal_command"}:
-        payload = dict(data or {})
-        meta = event.get("meta") or {}
-        if "risk_level" in meta and "risk_level" not in payload:
-            payload["risk_level"] = meta.get("risk_level")
-        if "message" in meta and "message" not in payload:
-            payload["message"] = meta.get("message")
-        insert_terminal_event(session_id, roll_no, lab_no, event_type, payload, recorded_at)
-    elif event_type == "browser_history":
-        insert_browser_history(session_id, roll_no, lab_no, data, recorded_at)
-
-
-def _fetch_rows(table: str, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
-    where_synced = "AND synced = 0" if unsynced_only else ""
     with _DB_LOCK:
         conn = _connect()
-        rows = conn.execute(
-            f"""
-            SELECT id, event_type, payload, recorded_at, lab_no
-            FROM {table}
-            WHERE session_id = ? AND roll_no = ? {where_synced}
-            ORDER BY recorded_at ASC
+        conn.execute(
+            """
+            INSERT INTO terminal_events
+            (session_id, roll_no, lab_no, event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at, synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
-            (session_id, roll_no),
-        ).fetchall()
+            (
+                session_id,
+                roll_no,
+                lab_no,
+                event_type,
+                data.get("tool"),
+                data.get("remote_ip"),
+                data.get("remote_host"),
+                data.get("remote_port"),
+                data.get("pid"),
+                data.get("full_command"),
+                data.get("risk_level"),
+                data.get("message"),
+                detected_at,
+            ),
+        )
+        conn.commit()
         conn.close()
 
-    out = []
-    for r in rows:
-        out.append(
-            {
-                "id": r["id"],
-                "eventType": r["event_type"] if "event_type" in r.keys() else None,
-                "data": json.loads(r["payload"]),
-                "recordedAt": r["recorded_at"],
-                "labNo": r["lab_no"],
-            }
-        )
+
+def insert_browser_history(session_id: str, roll_no: str, lab_no: str, data: Any, ts: Optional[float] = None) -> None:
+    rows = data if isinstance(data, list) else []
+    default_time = _to_recorded_at(ts)
+
+    with _DB_LOCK:
+        conn = _connect()
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            conn.execute(
+                """
+                INSERT INTO browser_history
+                (session_id, roll_no, lab_no, url, title, visit_count, last_visit, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    session_id,
+                    roll_no,
+                    lab_no,
+                    item.get("url"),
+                    item.get("title"),
+                    int(item.get("visit_count") or 1),
+                    item.get("last_visit") or default_time,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+
+def _load_processes(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
+    where_synced = "AND synced = 0" if unsynced_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT pid, process_name, cpu_percent, memory_mb, status, risk_level, category
+        FROM live_processes
+        WHERE session_id = ? AND roll_no = ? {where_synced}
+        ORDER BY recorded_at DESC
+        """,
+        (session_id, roll_no),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _load_devices(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
+    where_synced = "AND synced = 0" if unsynced_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT device_id, device_name, device_type, connected_at, disconnected_at, readable_name, risk_level, message
+        FROM connected_devices
+        WHERE session_id = ? AND roll_no = ? {where_synced}
+        ORDER BY connected_at DESC
+        """,
+        (session_id, roll_no),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _load_network(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> Optional[dict]:
+    where_synced = "AND synced = 0" if unsynced_only else ""
+    row = conn.execute(
+        f"""
+        SELECT ip_address, gateway, dns, active_connections
+        FROM network_info
+        WHERE session_id = ? AND roll_no = ? {where_synced}
+        ORDER BY recorded_at DESC
+        LIMIT 1
+        """,
+        (session_id, roll_no),
+    ).fetchone()
+    if not row:
+        return None
+
+    out = dict(row)
+    try:
+        out["dns"] = json.loads(out.get("dns") or "[]")
+    except Exception:
+        out["dns"] = []
+
+    try:
+        out["active_connections"] = json.loads(out.get("active_connections") or "[]")
+    except Exception:
+        out["active_connections"] = []
+
     return out
 
 
-def query_unsynced_records(session_id: str, roll_no: str) -> dict:
-    processes = _fetch_rows("processes", session_id, roll_no, unsynced_only=True)
-    devices = _fetch_rows("devices", session_id, roll_no, unsynced_only=True)
-    network = _fetch_rows("network_snapshots", session_id, roll_no, unsynced_only=True)
+def _load_domain_activity(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
+    where_synced = "AND synced = 0" if unsynced_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT domain, request_count, risk_level, last_accessed
+        FROM domain_activity
+        WHERE session_id = ? AND roll_no = ? {where_synced}
+        ORDER BY request_count DESC
+        """,
+        (session_id, roll_no),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
+
+def _load_terminal_events(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
+    where_synced = "AND synced = 0" if unsynced_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT event_type, tool, remote_ip, remote_host, remote_port, pid, full_command, risk_level, message, detected_at
+        FROM terminal_events
+        WHERE session_id = ? AND roll_no = ? {where_synced}
+        ORDER BY detected_at DESC
+        """,
+        (session_id, roll_no),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _load_browser_history(conn: sqlite3.Connection, session_id: str, roll_no: str, unsynced_only: bool) -> list[dict]:
+    where_synced = "AND synced = 0" if unsynced_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT url, title, visit_count, last_visit
+        FROM browser_history
+        WHERE session_id = ? AND roll_no = ? {where_synced}
+        ORDER BY last_visit DESC
+        """,
+        (session_id, roll_no),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _session_info(conn: sqlite3.Connection, session_id: str, roll_no: str) -> tuple[str, str]:
+    row = conn.execute(
+        """
+        SELECT name, lab_no
+        FROM sessions
+        WHERE session_id = ? AND roll_no = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (session_id, roll_no),
+    ).fetchone()
+    if not row:
+        return "", ""
+    return row["name"] or "", row["lab_no"] or ""
+
+
+def get_unsynced_export_payload(session_id: str, roll_no: str) -> tuple[dict, dict[str, list[int]]]:
     with _DB_LOCK:
         conn = _connect()
-        domains_raw = conn.execute(
-            """
-            SELECT id, payload, recorded_at, lab_no
-            FROM domain_activity
-            WHERE session_id = ? AND roll_no = ? AND synced = 0
-            ORDER BY recorded_at ASC
-            """,
-            (session_id, roll_no),
-        ).fetchall()
-        terminal_raw = conn.execute(
-            """
-            SELECT id, event_type, payload, recorded_at, lab_no
-            FROM terminal_events
-            WHERE session_id = ? AND roll_no = ? AND synced = 0
-            ORDER BY recorded_at ASC
-            """,
-            (session_id, roll_no),
-        ).fetchall()
-        browser_raw = conn.execute(
-            """
-            SELECT id, payload, recorded_at, lab_no
-            FROM browser_history
-            WHERE session_id = ? AND roll_no = ? AND synced = 0
-            ORDER BY recorded_at ASC
-            """,
-            (session_id, roll_no),
-        ).fetchall()
-        session_row = conn.execute(
-            """
-            SELECT name, lab_no
-            FROM sessions
-            WHERE session_id = ? AND roll_no = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (session_id, roll_no),
-        ).fetchone()
-        conn.close()
 
-    domains = [
-        {"id": r["id"], "data": json.loads(r["payload"]), "recordedAt": r["recorded_at"], "labNo": r["lab_no"]}
-        for r in domains_raw
-    ]
-    terminal = [
-        {
-            "id": r["id"],
-            "eventType": r["event_type"],
-            "data": json.loads(r["payload"]),
-            "recordedAt": r["recorded_at"],
-            "labNo": r["lab_no"],
+        name, lab_no = _session_info(conn, session_id, roll_no)
+        payload = {
+            "sessionId": session_id,
+            "rollNo": roll_no,
+            "labNo": lab_no,
+            "name": name,
+            "processes": _load_processes(conn, session_id, roll_no, unsynced_only=True),
+            "devices": _load_devices(conn, session_id, roll_no, unsynced_only=True),
+            "network": _load_network(conn, session_id, roll_no, unsynced_only=True),
+            "domainActivity": _load_domain_activity(conn, session_id, roll_no, unsynced_only=True),
+            "terminalEvents": _load_terminal_events(conn, session_id, roll_no, unsynced_only=True),
+            "browserHistory": _load_browser_history(conn, session_id, roll_no, unsynced_only=True),
         }
-        for r in terminal_raw
-    ]
-    browser = [
-        {"id": r["id"], "data": json.loads(r["payload"]), "recordedAt": r["recorded_at"], "labNo": r["lab_no"]}
-        for r in browser_raw
-    ]
 
-    lab_no = session_row["lab_no"] if session_row else ""
-    name = session_row["name"] if session_row else ""
+        id_map = {
+            "processes": [r["id"] for r in conn.execute("SELECT id FROM live_processes WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
+            "devices": [r["id"] for r in conn.execute("SELECT id FROM connected_devices WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
+            "network": [r["id"] for r in conn.execute("SELECT id FROM network_info WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
+            "domainActivity": [r["id"] for r in conn.execute("SELECT id FROM domain_activity WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
+            "terminalEvents": [r["id"] for r in conn.execute("SELECT id FROM terminal_events WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
+            "browserHistory": [r["id"] for r in conn.execute("SELECT id FROM browser_history WHERE session_id = ? AND roll_no = ? AND synced = 0", (session_id, roll_no)).fetchall()],
+        }
 
-    return {
-        "sessionId": session_id,
-        "rollNo": roll_no,
-        "labNo": lab_no,
-        "name": name,
-        "recordedAt": _now_iso(),
-        "processes": processes,
-        "devices": devices,
-        "network": network,
-        "domainActivity": domains,
-        "terminalEvents": terminal,
-        "browserHistory": browser,
-    }
+        conn.close()
+        return payload, id_map
 
 
 def mark_synced(id_map: dict[str, list[int]]) -> None:
     table_map = {
-        "processes": "processes",
-        "devices": "devices",
-        "network": "network_snapshots",
+        "processes": "live_processes",
+        "devices": "connected_devices",
+        "network": "network_info",
         "domainActivity": "domain_activity",
         "terminalEvents": "terminal_events",
         "browserHistory": "browser_history",
@@ -402,149 +737,21 @@ def mark_synced(id_map: dict[str, list[int]]) -> None:
         conn.close()
 
 
-def _collapse_events_for_payload(records: dict) -> dict:
-    def _latest_by_type(rows: list[dict], target_type: str):
-        filtered = [r for r in rows if r.get("eventType") == target_type]
-        return filtered[-1]["data"] if filtered else None
-
-    process_rows = records.get("processes", [])
-    latest_snapshot = _latest_by_type(process_rows, "process_snapshot")
-    if latest_snapshot is None:
-        latest_snapshot = []
-
-    device_rows = records.get("devices", [])
-    latest_devices = _latest_by_type(device_rows, "devices_snapshot")
-    if latest_devices is None:
-        latest_devices = {"usb": [], "external": []}
-
-    network_rows = records.get("network", [])
-    latest_network = None
-    for row in reversed(network_rows):
-        if row.get("eventType") in {"network_update", "network_snapshot"}:
-            latest_network = row["data"]
-            break
-
-    domain_activity = []
-    for row in records.get("domainActivity", []):
-        data = row.get("data")
-        if isinstance(data, list):
-            domain_activity.extend(data)
-
-    terminal_events = []
-    for row in records.get("terminalEvents", []):
-        data = dict(row.get("data") or {})
-        data["eventType"] = row.get("eventType")
-        terminal_events.append(data)
-
-    browser_history = []
-    for row in records.get("browserHistory", []):
-        data = row.get("data")
-        if isinstance(data, list):
-            browser_history.extend(data)
-
-    return {
-        "sessionId": records.get("sessionId"),
-        "rollNo": records.get("rollNo"),
-        "labNo": records.get("labNo"),
-        "name": records.get("name", ""),
-        "recordedAt": records.get("recordedAt"),
-        "processes": latest_snapshot,
-        "devices": latest_devices,
-        "network": latest_network,
-        "domainActivity": domain_activity,
-        "terminalEvents": terminal_events,
-        "browserHistory": browser_history,
-    }
-
-
-def get_unsynced_export_payload(session_id: str, roll_no: str) -> tuple[dict, dict[str, list[int]]]:
-    records = query_unsynced_records(session_id, roll_no)
-    id_map = {
-        "processes": [x["id"] for x in records.get("processes", [])],
-        "devices": [x["id"] for x in records.get("devices", [])],
-        "network": [x["id"] for x in records.get("network", [])],
-        "domainActivity": [x["id"] for x in records.get("domainActivity", [])],
-        "terminalEvents": [x["id"] for x in records.get("terminalEvents", [])],
-        "browserHistory": [x["id"] for x in records.get("browserHistory", [])],
-    }
-    payload = _collapse_events_for_payload(records)
-    return payload, id_map
-
-
 def get_latest_session_payload(session_id: str, roll_no: str) -> dict:
-    records = {
-        "sessionId": session_id,
-        "rollNo": roll_no,
-        "recordedAt": _now_iso(),
-        "processes": _fetch_rows("processes", session_id, roll_no, unsynced_only=False),
-        "devices": _fetch_rows("devices", session_id, roll_no, unsynced_only=False),
-        "network": _fetch_rows("network_snapshots", session_id, roll_no, unsynced_only=False),
-        "domainActivity": [],
-        "terminalEvents": [],
-        "browserHistory": [],
-    }
-
     with _DB_LOCK:
         conn = _connect()
-        session_row = conn.execute(
-            """
-            SELECT name, lab_no
-            FROM sessions
-            WHERE session_id = ? AND roll_no = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (session_id, roll_no),
-        ).fetchone()
-
-        domains_raw = conn.execute(
-            """
-            SELECT id, payload, recorded_at, lab_no
-            FROM domain_activity
-            WHERE session_id = ? AND roll_no = ?
-            ORDER BY recorded_at ASC
-            """,
-            (session_id, roll_no),
-        ).fetchall()
-        terminal_raw = conn.execute(
-            """
-            SELECT id, event_type, payload, recorded_at, lab_no
-            FROM terminal_events
-            WHERE session_id = ? AND roll_no = ?
-            ORDER BY recorded_at ASC
-            """,
-            (session_id, roll_no),
-        ).fetchall()
-        browser_raw = conn.execute(
-            """
-            SELECT id, payload, recorded_at, lab_no
-            FROM browser_history
-            WHERE session_id = ? AND roll_no = ?
-            ORDER BY recorded_at ASC
-            """,
-            (session_id, roll_no),
-        ).fetchall()
-        conn.close()
-
-    records["name"] = session_row["name"] if session_row else ""
-    records["labNo"] = session_row["lab_no"] if session_row else ""
-    records["domainActivity"] = [
-        {"id": r["id"], "data": json.loads(r["payload"]), "recordedAt": r["recorded_at"], "labNo": r["lab_no"]}
-        for r in domains_raw
-    ]
-    records["terminalEvents"] = [
-        {
-            "id": r["id"],
-            "eventType": r["event_type"],
-            "data": json.loads(r["payload"]),
-            "recordedAt": r["recorded_at"],
-            "labNo": r["lab_no"],
+        name, lab_no = _session_info(conn, session_id, roll_no)
+        out = {
+            "sessionId": session_id,
+            "rollNo": roll_no,
+            "labNo": lab_no,
+            "name": name,
+            "processes": _load_processes(conn, session_id, roll_no, unsynced_only=False),
+            "devices": _load_devices(conn, session_id, roll_no, unsynced_only=False),
+            "network": _load_network(conn, session_id, roll_no, unsynced_only=False),
+            "domainActivity": _load_domain_activity(conn, session_id, roll_no, unsynced_only=False),
+            "terminalEvents": _load_terminal_events(conn, session_id, roll_no, unsynced_only=False),
+            "browserHistory": _load_browser_history(conn, session_id, roll_no, unsynced_only=False),
         }
-        for r in terminal_raw
-    ]
-    records["browserHistory"] = [
-        {"id": r["id"], "data": json.loads(r["payload"]), "recordedAt": r["recorded_at"], "labNo": r["lab_no"]}
-        for r in browser_raw
-    ]
-
-    return _collapse_events_for_payload(records)
+        conn.close()
+        return out
