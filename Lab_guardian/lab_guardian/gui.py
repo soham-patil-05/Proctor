@@ -267,12 +267,14 @@ class LabGuardianGUI:
 
         # Network tab
         self.network_empty_var = tk.StringVar(value="")
+        self.network_debug_var = tk.StringVar(value="Browser entries fetched: 0")
         self.network_tree = self._tree_with_scroll(
             network_tab,
             ("title", "url", "browser", "last_visited", "visit_count"),
             ("Page Title", "URL", "Browser", "Last Visited", "Visits"),
         )
         tk.Label(network_tab, textvariable=self.network_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(4, 8))
+        tk.Label(network_tab, textvariable=self.network_debug_var, bg="#FFFFFF", fg="#607D8B", font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=(0, 8))
 
         # Processes tab
         self.processes_empty_var = tk.StringVar(value="")
@@ -367,6 +369,7 @@ class LabGuardianGUI:
             "processes": set(),
             "terminalEvents": set(),
         }
+        self.network_debug_var.set("Browser entries fetched: 0")
         self.terminal_debug_var.set("Terminal events fetched: 0")
         for tree in [
             getattr(self, "device_tree", None),
@@ -559,10 +562,13 @@ class LabGuardianGUI:
 
         # Network (Browser History)
         browser_history = sorted(
-            payload.get("browserHistory", []),
+            payload.get("browser_history", payload.get("browserHistory", [])),
             key=lambda item: float(item.get("last_visited") or 0),
             reverse=False,
         )
+        # Browser history can update in place (visit_count/last_visited), so repaint each cycle.
+        self._clear_tree(self.network_tree)
+        self.displayed_rowids["browserHistory"] = set()
         for row in browser_history:
             row_id = row.get("_rowid")
             if row_id in self.displayed_rowids["browserHistory"]:
@@ -580,6 +586,7 @@ class LabGuardianGUI:
                     int(row.get("visit_count") or 1),
                 ),
             )
+        self.network_debug_var.set(f"Browser entries fetched: {len(browser_history)}")
         self.network_empty_var.set("No browsing activity since session started." if len(self.network_tree.get_children()) == 0 else "")
 
         # Processes

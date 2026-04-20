@@ -224,7 +224,6 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
             """
             CREATE UNIQUE INDEX IF NOT EXISTS ux_browser_history_session_roll_url
             ON browser_history (session_id, roll_no, url)
-            WHERE url IS NOT NULL
             """
         )
 
