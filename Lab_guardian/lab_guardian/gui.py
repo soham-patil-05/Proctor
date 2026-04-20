@@ -285,12 +285,14 @@ class LabGuardianGUI:
 
         # Terminal tab
         self.terminal_empty_var = tk.StringVar(value="")
+        self.terminal_debug_var = tk.StringVar(value="Terminal events fetched: 0")
         self.terminal_tree = self._tree_with_scroll(
             terminal_tab,
             ("detected_at", "event_type", "tool", "full_command", "remote_ip", "risk_level"),
             ("Time", "Event Type", "Tool", "Command", "Remote IP", "Risk"),
         )
         tk.Label(terminal_tab, textvariable=self.terminal_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(4, 8))
+        tk.Label(terminal_tab, textvariable=self.terminal_debug_var, bg="#FFFFFF", fg="#607D8B", font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=(0, 8))
 
         self.status_bar = tk.Label(self.session_frame, textvariable=self.status_bar_var, bg="#ECEFF1", fg="#546E7A", font=("Segoe UI", 8), anchor="w")
         self.status_bar.pack(fill=tk.X)
@@ -365,6 +367,7 @@ class LabGuardianGUI:
             "processes": set(),
             "terminalEvents": set(),
         }
+        self.terminal_debug_var.set("Terminal events fetched: 0")
         for tree in [
             getattr(self, "device_tree", None),
             getattr(self, "network_tree", None),
@@ -619,10 +622,13 @@ class LabGuardianGUI:
 
         # Terminal
         terminal_rows = sorted(
-            payload.get("terminalEvents", []),
+            payload.get("terminal_events", payload.get("terminalEvents", [])),
             key=lambda item: str(item.get("detected_at") or ""),
             reverse=False,
         )
+        # Keep terminal rendering fully in sync with DB state per refresh.
+        self._clear_tree(self.terminal_tree)
+        self.displayed_rowids["terminalEvents"] = set()
         for row in terminal_rows:
             row_id = row.get("_rowid")
             if row_id in self.displayed_rowids["terminalEvents"]:
@@ -652,6 +658,7 @@ class LabGuardianGUI:
                 tags=(self._risk_tag(row.get("risk_level")),),
             )
 
+        self.terminal_debug_var.set(f"Terminal events fetched: {len(terminal_rows)}")
         self.terminal_empty_var.set("No terminal activity recorded." if len(self.terminal_tree.get_children()) == 0 else "")
 
         self.status_bar_var.set(

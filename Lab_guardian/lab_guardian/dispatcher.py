@@ -50,25 +50,22 @@ def _normalize_process(process: dict) -> dict:
 
 
 def _normalize_terminal(event: dict, event_type: str, ts: Optional[float]) -> dict:
-    detected_at = event.get("detected_at") or event.get("ts")
+    detected_at = event.get("detected_at")
     if not detected_at:
-        if ts is not None:
-            detected_at = datetime.utcfromtimestamp(float(ts)).isoformat() + "Z"
-        else:
-            detected_at = datetime.utcnow().isoformat() + "Z"
+        detected_at = datetime.utcnow().isoformat()
 
     return {
         "id": event.get("id"),
-        "event_type": event.get("event_type") or event_type,
+        "event_type": event_type,
         "tool": event.get("tool") or "unknown",
         "detected_at": str(detected_at),
-        "pid": event.get("pid"),
-        "full_command": event.get("full_command"),
-        "remote_ip": event.get("remote_ip"),
-        "remote_port": str(event.get("remote_port")) if event.get("remote_port") is not None else None,
-        "remote_host": event.get("remote_host"),
-        "message": event.get("message"),
-        "risk_level": event.get("risk_level") or "normal",
+        "pid": event.get("pid") if event.get("pid") is not None else 0,
+        "full_command": event.get("full_command") or "",
+        "remote_ip": event.get("remote_ip") or "",
+        "remote_port": event.get("remote_port") if event.get("remote_port") is not None else 0,
+        "remote_host": event.get("remote_host") or "",
+        "message": event.get("message") or "",
+        "risk_level": event.get("risk_level") or "low",
     }
 
 
@@ -192,13 +189,22 @@ async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[a
                 if data.get("pid") is not None:
                     db.delete_process(session_id, roll_no, data.get("pid"))
 
-            elif event_type in {"terminal_request", "terminal_command"} and isinstance(data, dict):
+            elif event_type == "terminal_request" and isinstance(data, dict):
                 merged = dict(data)
                 if meta.get("risk_level") is not None and merged.get("risk_level") is None:
                     merged["risk_level"] = meta.get("risk_level")
                 if meta.get("message") is not None and merged.get("message") is None:
                     merged["message"] = meta.get("message")
-                normalized = _normalize_terminal(merged, event_type, ts)
+                normalized = _normalize_terminal(merged, "terminal_request", ts)
+                db.save_terminal_event(session_id, roll_no, normalized)
+
+            elif event_type == "terminal_command" and isinstance(data, dict):
+                merged = dict(data)
+                if meta.get("risk_level") is not None and merged.get("risk_level") is None:
+                    merged["risk_level"] = meta.get("risk_level")
+                if meta.get("message") is not None and merged.get("message") is None:
+                    merged["message"] = meta.get("message")
+                normalized = _normalize_terminal(merged, "terminal_command", ts)
                 db.save_terminal_event(session_id, roll_no, normalized)
 
             elif event_type == "terminal_events_snapshot" and isinstance(data, list):

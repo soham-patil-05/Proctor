@@ -63,6 +63,50 @@ def _ensure_optional_column(cur: sqlite3.Cursor, table_name: str, column_sql: st
         pass
 
 
+def _dedupe_browser_rows(cur: sqlite3.Cursor) -> None:
+    # Keep one row per (session_id, roll_no, url) and preserve max counters.
+    cur.execute(
+        """
+        WITH merged AS (
+            SELECT
+                session_id,
+                roll_no,
+                url,
+                MAX(COALESCE(visit_count, 0)) AS max_visit_count,
+                MAX(COALESCE(last_visited, 0)) AS max_last_visited,
+                MAX(rowid) AS keep_rowid
+            FROM browser_history
+            WHERE url IS NOT NULL
+            GROUP BY session_id, roll_no, url
+        )
+        UPDATE browser_history
+        SET
+            visit_count = (
+                SELECT m.max_visit_count
+                FROM merged m
+                WHERE m.keep_rowid = browser_history.rowid
+            ),
+            last_visited = (
+                SELECT m.max_last_visited
+                FROM merged m
+                WHERE m.keep_rowid = browser_history.rowid
+            )
+        WHERE rowid IN (SELECT keep_rowid FROM merged)
+        """
+    )
+    cur.execute(
+        """
+        DELETE FROM browser_history
+        WHERE url IS NOT NULL
+          AND rowid NOT IN (
+              SELECT MAX(rowid)
+              FROM browser_history
+              GROUP BY session_id, roll_no, url
+          )
+        """
+    )
+
+
 def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
     global _DB_PATH
     if db_path:
@@ -92,6 +136,7 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
                 session_id TEXT NOT NULL,
                 roll_no    TEXT NOT NULL,
                 pid        INTEGER,
+                process_name TEXT,
                 name       TEXT,
                 label      TEXT,
                 cpu        REAL,
@@ -110,12 +155,15 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
             CREATE TABLE IF NOT EXISTS usb_devices (
                 session_id    TEXT NOT NULL,
                 roll_no       TEXT NOT NULL,
+                device_id     TEXT,
                 id            TEXT,
                 readable_name TEXT,
                 message       TEXT,
                 risk_level    TEXT,
                 metadata      TEXT,
                 device_type   TEXT,
+                connected_at  TEXT,
+                disconnected_at TEXT,
                 detected_at   TEXT,
                 synced        INTEGER NOT NULL DEFAULT 0
             )
@@ -132,7 +180,8 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
                 visit_count  INTEGER,
                 last_visited REAL,
                 browser      TEXT,
-                synced       INTEGER NOT NULL DEFAULT 0
+                synced       INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (session_id, roll_no, url)
             )
             """
         )
@@ -140,6 +189,7 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS terminal_events (
+                id           TEXT,
                 session_id   TEXT NOT NULL,
                 roll_no      TEXT NOT NULL,
                 event_type   TEXT,
@@ -162,7 +212,21 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
 
         _ensure_optional_column(cur, "processes", "category TEXT")
         _ensure_optional_column(cur, "processes", "detected_at TEXT")
+        _ensure_optional_column(cur, "processes", "process_name TEXT")
+        _ensure_optional_column(cur, "usb_devices", "device_id TEXT")
+        _ensure_optional_column(cur, "usb_devices", "connected_at TEXT")
+        _ensure_optional_column(cur, "usb_devices", "disconnected_at TEXT")
         _ensure_optional_column(cur, "usb_devices", "detected_at TEXT")
+        _ensure_optional_column(cur, "terminal_events", "id TEXT")
+
+        _dedupe_browser_rows(cur)
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_browser_history_session_roll_url
+            ON browser_history (session_id, roll_no, url)
+            WHERE url IS NOT NULL
+            """
+        )
 
         conn.commit()
         return conn
@@ -203,23 +267,71 @@ def replace_processes(session_id: str, roll_no: str, process_list: list[dict]) -
         for process in process_list or []:
             if not isinstance(process, dict):
                 continue
+            pid = _safe_int(process.get("pid"))
+            process_name = str(process.get("name") or process.get("label") or "").strip() or None
+            if pid is None or not process_name:
+                continue
+            cpu = _safe_float(process.get("cpu"))
+            memory = _safe_float(process.get("memory"))
+            status = process.get("status") or "running"
+            risk_level = _normalize_risk(process.get("risk_level"))
+            category = process.get("category")
+            detected_at = process.get("detected_at") or _now_iso()
             conn.execute(
                 """
-                INSERT INTO processes (session_id, roll_no, pid, name, label, cpu, memory, status, risk_level, category, detected_at, synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                INSERT OR IGNORE INTO processes (
+                    session_id, roll_no, pid, process_name, name, label, cpu, memory,
+                    status, risk_level, category, detected_at, synced
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM processes
+                    WHERE session_id = ?
+                      AND roll_no = ?
+                      AND pid = ?
+                      AND process_name = ?
+                )
                 """,
                 (
                     session_id,
                     roll_no,
-                    _safe_int(process.get("pid")),
+                    pid,
+                    process_name,
                     process.get("name"),
                     process.get("label"),
-                    _safe_float(process.get("cpu")),
-                    _safe_float(process.get("memory")),
-                    process.get("status") or "running",
-                    _normalize_risk(process.get("risk_level")),
-                    process.get("category"),
-                    process.get("detected_at") or _now_iso(),
+                    cpu,
+                    memory,
+                    status,
+                    risk_level,
+                    category,
+                    detected_at,
+                    session_id,
+                    roll_no,
+                    pid,
+                    process_name,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE processes
+                SET cpu = ?, memory = ?, status = ?, risk_level = ?, category = ?, name = ?, label = ?, synced = 0
+                                WHERE session_id = ?
+                                    AND roll_no = ?
+                                    AND pid = ?
+                                    AND COALESCE(status, 'running') <> 'ended'
+                """,
+                (
+                    cpu,
+                    memory,
+                    status,
+                    risk_level,
+                    category,
+                    process.get("name"),
+                    process.get("label"),
+                    session_id,
+                    roll_no,
+                    pid,
                 ),
             )
         conn.commit()
@@ -231,23 +343,72 @@ def upsert_process(session_id: str, roll_no: str, process: dict) -> None:
         return
     with _DB_LOCK:
         conn = _connect()
+        pid = _safe_int(process.get("pid"))
+        process_name = str(process.get("name") or process.get("label") or "").strip() or None
+        if pid is None or not process_name:
+            conn.close()
+            return
+        cpu = _safe_float(process.get("cpu"))
+        memory = _safe_float(process.get("memory"))
+        status = process.get("status") or "running"
+        risk_level = _normalize_risk(process.get("risk_level"))
+        category = process.get("category")
+        detected_at = process.get("detected_at") or _now_iso()
         conn.execute(
             """
-            INSERT INTO processes (session_id, roll_no, pid, name, label, cpu, memory, status, risk_level, category, detected_at, synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            INSERT OR IGNORE INTO processes (
+                session_id, roll_no, pid, process_name, name, label, cpu, memory,
+                status, risk_level, category, detected_at, synced
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM processes
+                WHERE session_id = ?
+                  AND roll_no = ?
+                  AND pid = ?
+                  AND process_name = ?
+            )
             """,
             (
                 session_id,
                 roll_no,
-                _safe_int(process.get("pid")),
+                pid,
+                process_name,
                 process.get("name"),
                 process.get("label"),
-                _safe_float(process.get("cpu")),
-                _safe_float(process.get("memory")),
-                process.get("status") or "running",
-                _normalize_risk(process.get("risk_level")),
-                process.get("category"),
-                process.get("detected_at") or _now_iso(),
+                cpu,
+                memory,
+                status,
+                risk_level,
+                category,
+                detected_at,
+                session_id,
+                roll_no,
+                pid,
+                process_name,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE processes
+            SET cpu = ?, memory = ?, status = ?, risk_level = ?, category = ?, name = ?, label = ?, synced = 0
+                        WHERE session_id = ?
+                            AND roll_no = ?
+                            AND pid = ?
+                            AND COALESCE(status, 'running') <> 'ended'
+            """,
+            (
+                cpu,
+                memory,
+                status,
+                risk_level,
+                category,
+                process.get("name"),
+                process.get("label"),
+                session_id,
+                roll_no,
+                pid,
             ),
         )
         conn.commit()
@@ -255,20 +416,47 @@ def upsert_process(session_id: str, roll_no: str, process: dict) -> None:
 
 
 def update_process(session_id: str, roll_no: str, process: dict) -> None:
-    # Append-only semantics: updates become new rows.
-    upsert_process(session_id, roll_no, process)
-
-
-def delete_process(session_id: str, roll_no: str, pid: int) -> None:
-    # Append-only semantics: process_end is persisted as status=ended event row.
+    if not isinstance(process, dict):
+        return
+    pid = _safe_int(process.get("pid"))
+    if pid is None:
+        return
     with _DB_LOCK:
         conn = _connect()
         conn.execute(
             """
-            INSERT INTO processes (session_id, roll_no, pid, name, label, cpu, memory, status, risk_level, category, detected_at, synced)
-            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, 'ended', NULL, NULL, ?, 0)
+            UPDATE processes
+            SET cpu = ?, memory = ?, status = ?, risk_level = ?, category = ?, synced = 0
+                        WHERE session_id = ?
+                            AND roll_no = ?
+                            AND pid = ?
+                            AND COALESCE(status, 'running') <> 'ended'
             """,
-            (session_id, roll_no, _safe_int(pid), _now_iso()),
+            (
+                _safe_float(process.get("cpu")),
+                _safe_float(process.get("memory")),
+                process.get("status") or "running",
+                _normalize_risk(process.get("risk_level")),
+                process.get("category"),
+                session_id,
+                roll_no,
+                pid,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+
+def delete_process(session_id: str, roll_no: str, pid: int) -> None:
+    with _DB_LOCK:
+        conn = _connect()
+        conn.execute(
+            """
+            UPDATE processes
+            SET status = 'ended', synced = 0
+            WHERE session_id = ? AND roll_no = ? AND pid = ? AND COALESCE(status, 'running') <> 'ended'
+            """,
+            (session_id, roll_no, _safe_int(pid)),
         )
         conn.commit()
         conn.close()
@@ -280,22 +468,42 @@ def replace_devices(session_id: str, roll_no: str, device_list: list[dict]) -> N
         for device in device_list or []:
             if not isinstance(device, dict):
                 continue
+            device_id = str(device.get("id") or device.get("device_id") or "").strip() or None
+            if not device_id:
+                continue
             metadata = device.get("metadata") if isinstance(device.get("metadata"), dict) else {}
+            detected_at = device.get("detected_at") or _now_iso()
             conn.execute(
                 """
-                INSERT INTO usb_devices (session_id, roll_no, id, readable_name, message, risk_level, metadata, device_type, detected_at, synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                INSERT OR IGNORE INTO usb_devices (
+                    session_id, roll_no, device_id, id, readable_name, message, risk_level,
+                    metadata, device_type, connected_at, detected_at, disconnected_at, synced
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM usb_devices
+                    WHERE session_id = ?
+                      AND roll_no = ?
+                      AND COALESCE(device_id, id) = ?
+                      AND disconnected_at IS NULL
+                )
                 """,
                 (
                     session_id,
                     roll_no,
-                    str(device.get("id") or "").strip() or None,
+                    device_id,
+                    device_id,
                     device.get("readable_name"),
                     device.get("message"),
                     _normalize_risk(device.get("risk_level")),
                     json.dumps(metadata, ensure_ascii=True),
                     device.get("device_type") or "usb",
-                    device.get("detected_at") or _now_iso(),
+                    detected_at,
+                    detected_at,
+                    session_id,
+                    roll_no,
+                    device_id,
                 ),
             )
         conn.commit()
@@ -307,22 +515,43 @@ def upsert_device(session_id: str, roll_no: str, device: dict) -> None:
         return
     with _DB_LOCK:
         conn = _connect()
+        device_id = str(device.get("id") or device.get("device_id") or "").strip() or None
+        if not device_id:
+            conn.close()
+            return
         metadata = device.get("metadata") if isinstance(device.get("metadata"), dict) else {}
+        detected_at = device.get("detected_at") or _now_iso()
         conn.execute(
             """
-            INSERT INTO usb_devices (session_id, roll_no, id, readable_name, message, risk_level, metadata, device_type, detected_at, synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            INSERT OR IGNORE INTO usb_devices (
+                session_id, roll_no, device_id, id, readable_name, message, risk_level,
+                metadata, device_type, connected_at, detected_at, disconnected_at, synced
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM usb_devices
+                WHERE session_id = ?
+                  AND roll_no = ?
+                  AND COALESCE(device_id, id) = ?
+                  AND disconnected_at IS NULL
+            )
             """,
             (
                 session_id,
                 roll_no,
-                str(device.get("id") or "").strip() or None,
+                device_id,
+                device_id,
                 device.get("readable_name"),
                 device.get("message"),
                 _normalize_risk(device.get("risk_level")),
                 json.dumps(metadata, ensure_ascii=True),
                 device.get("device_type") or "usb",
-                device.get("detected_at") or _now_iso(),
+                detected_at,
+                detected_at,
+                session_id,
+                roll_no,
+                device_id,
             ),
         )
         conn.commit()
@@ -334,10 +563,14 @@ def remove_device(session_id: str, roll_no: str, device_id: str) -> None:
         conn = _connect()
         conn.execute(
             """
-            INSERT INTO usb_devices (session_id, roll_no, id, readable_name, message, risk_level, metadata, device_type, detected_at, synced)
-            VALUES (?, ?, ?, NULL, 'Device disconnected', 'low', '{}', 'usb', ?, 0)
+                        UPDATE usb_devices
+                        SET disconnected_at = ?, synced = 0
+                        WHERE session_id = ?
+                            AND roll_no = ?
+                            AND COALESCE(device_id, id) = ?
+                            AND disconnected_at IS NULL
             """,
-            (session_id, roll_no, str(device_id or "").strip() or None, _now_iso()),
+                        (_now_iso(), session_id, roll_no, str(device_id or "").strip() or None),
         )
         conn.commit()
         conn.close()
@@ -346,20 +579,33 @@ def remove_device(session_id: str, roll_no: str, device_id: str) -> None:
 def upsert_browser_history(session_id: str, roll_no: str, entry: dict) -> None:
     if not isinstance(entry, dict):
         return
+    url = str(entry.get("url") or "").strip()
+    if not url:
+        return
+
+    visit_count = _safe_int(entry.get("visit_count")) or 1
+    last_visited = _safe_float(entry.get("last_visited"))
     with _DB_LOCK:
         conn = _connect()
         conn.execute(
             """
             INSERT INTO browser_history (session_id, roll_no, url, title, visit_count, last_visited, browser, synced)
             VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(session_id, roll_no, url)
+            DO UPDATE SET
+                title = COALESCE(excluded.title, browser_history.title),
+                visit_count = MAX(COALESCE(browser_history.visit_count, 0), COALESCE(excluded.visit_count, 0)),
+                last_visited = MAX(COALESCE(browser_history.last_visited, 0), COALESCE(excluded.last_visited, 0)),
+                browser = COALESCE(excluded.browser, browser_history.browser),
+                synced = 0
             """,
             (
                 session_id,
                 roll_no,
-                entry.get("url"),
+                url,
                 entry.get("title"),
-                _safe_int(entry.get("visit_count")) or 1,
-                _safe_float(entry.get("last_visited")),
+                visit_count,
+                last_visited,
                 entry.get("browser"),
             ),
         )
@@ -375,12 +621,13 @@ def save_terminal_event(session_id: str, roll_no: str, event: dict) -> None:
         conn.execute(
             """
             INSERT INTO terminal_events (
-                session_id, roll_no, event_type, tool, remote_ip, remote_host, remote_port,
+                id, session_id, roll_no, event_type, tool, remote_ip, remote_host, remote_port,
                 pid, full_command, risk_level, message, detected_at, synced
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
             (
+                event.get("id"),
                 session_id,
                 roll_no,
                 event.get("event_type"),
@@ -413,12 +660,13 @@ def replace_terminal_events(session_id: str, roll_no: str, event_list: list[dict
             conn.execute(
                 """
                 INSERT INTO terminal_events (
-                    session_id, roll_no, event_type, tool, remote_ip, remote_host, remote_port,
+                    id, session_id, roll_no, event_type, tool, remote_ip, remote_host, remote_port,
                     pid, full_command, risk_level, message, detected_at, synced
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
+                    event.get("id"),
                     session_id,
                     roll_no,
                     event.get("event_type"),
@@ -455,10 +703,18 @@ def get_all_for_session(session_id: str, roll_no: str) -> dict:
 
         device_rows = conn.execute(
             """
-            SELECT rowid AS _rowid, id, readable_name, message, risk_level, metadata, device_type, detected_at
+            SELECT rowid AS _rowid,
+                   COALESCE(device_id, id) AS id,
+                   readable_name,
+                   message,
+                   risk_level,
+                   metadata,
+                   device_type,
+                   COALESCE(connected_at, detected_at) AS detected_at,
+                   disconnected_at
             FROM usb_devices
             WHERE session_id = ? AND roll_no = ?
-            ORDER BY COALESCE(detected_at, ''), rowid ASC
+            ORDER BY COALESCE(connected_at, detected_at, ''), rowid ASC
             """,
             (session_id, roll_no),
         ).fetchall()
@@ -475,7 +731,16 @@ def get_all_for_session(session_id: str, roll_no: str) -> dict:
 
         process_rows = conn.execute(
             """
-            SELECT rowid AS _rowid, pid, name, label, cpu, memory, status, risk_level, category, detected_at
+            SELECT rowid AS _rowid,
+                   pid,
+                   COALESCE(name, process_name) AS name,
+                   label,
+                   cpu,
+                   memory,
+                   status,
+                   risk_level,
+                   category,
+                   detected_at
             FROM processes
             WHERE session_id = ? AND roll_no = ?
             ORDER BY COALESCE(detected_at, ''), rowid ASC
@@ -485,11 +750,10 @@ def get_all_for_session(session_id: str, roll_no: str) -> dict:
 
         terminal_rows = conn.execute(
             """
-            SELECT rowid AS _rowid, event_type, tool, remote_ip, remote_host, remote_port, pid,
-                   full_command, risk_level, message, detected_at
+            SELECT rowid AS _rowid, *
             FROM terminal_events
             WHERE session_id = ? AND roll_no = ?
-            ORDER BY COALESCE(detected_at, ''), rowid ASC
+            ORDER BY detected_at ASC
             """,
             (session_id, roll_no),
         ).fetchall()
@@ -506,6 +770,7 @@ def get_all_for_session(session_id: str, roll_no: str) -> dict:
         "devices": devices,
         "browserHistory": [dict(row) for row in browser_rows],
         "processes": [dict(row) for row in process_rows],
+        "terminal_events": [dict(row) for row in terminal_rows],
         "terminalEvents": [dict(row) for row in terminal_rows],
     }
 
@@ -516,10 +781,18 @@ def get_unsynced(session_id: str, roll_no: str) -> dict:
 
         device_rows = conn.execute(
             """
-            SELECT rowid AS _rowid, id, readable_name, message, risk_level, metadata, device_type, detected_at
+            SELECT rowid AS _rowid,
+                   COALESCE(device_id, id) AS id,
+                   readable_name,
+                   message,
+                   risk_level,
+                   metadata,
+                   device_type,
+                   COALESCE(connected_at, detected_at) AS detected_at,
+                   disconnected_at
             FROM usb_devices
             WHERE session_id = ? AND roll_no = ? AND synced = 0
-            ORDER BY COALESCE(detected_at, ''), rowid ASC
+            ORDER BY COALESCE(connected_at, detected_at, ''), rowid ASC
             """,
             (session_id, roll_no),
         ).fetchall()
@@ -536,7 +809,16 @@ def get_unsynced(session_id: str, roll_no: str) -> dict:
 
         process_rows = conn.execute(
             """
-            SELECT rowid AS _rowid, pid, name, label, cpu, memory, status, risk_level, category, detected_at
+            SELECT rowid AS _rowid,
+                   pid,
+                   COALESCE(name, process_name) AS name,
+                   label,
+                   cpu,
+                   memory,
+                   status,
+                   risk_level,
+                   category,
+                   detected_at
             FROM processes
             WHERE session_id = ? AND roll_no = ? AND synced = 0
             ORDER BY COALESCE(detected_at, ''), rowid ASC
@@ -546,11 +828,10 @@ def get_unsynced(session_id: str, roll_no: str) -> dict:
 
         terminal_rows = conn.execute(
             """
-            SELECT rowid AS _rowid, event_type, tool, remote_ip, remote_host, remote_port, pid,
-                   full_command, risk_level, message, detected_at
+            SELECT rowid AS _rowid, *
             FROM terminal_events
             WHERE session_id = ? AND roll_no = ? AND synced = 0
-            ORDER BY COALESCE(detected_at, ''), rowid ASC
+            ORDER BY detected_at ASC
             """,
             (session_id, roll_no),
         ).fetchall()
@@ -567,6 +848,7 @@ def get_unsynced(session_id: str, roll_no: str) -> dict:
         "processes": [dict(row) for row in process_rows],
         "devices": devices,
         "browserHistory": [dict(row) for row in browser_rows],
+        "terminal_events": [dict(row) for row in terminal_rows],
         "terminalEvents": [dict(row) for row in terminal_rows],
     }
 
