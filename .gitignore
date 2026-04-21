@@ -4,3 +4,6 @@ __pycache__/
 node_modules/
 .env
 Lab_guardian/venv/
+temp_edge.db
+temp_history.db
+*.db
