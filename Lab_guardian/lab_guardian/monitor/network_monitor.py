@@ -1,6 +1,6 @@
 """network_monitor.py — Terminal command monitoring.
 
-Two detection layers run concurrently:
+Three detection layers run concurrently:
 
   Layer 1 — ``ss -tnp`` polling (no root required)
       Detects terminal tools (curl, wget, git, ssh …) making live TCP
@@ -11,11 +11,19 @@ Two detection layers run concurrently:
       network-capable executables.  Skipped gracefully when the audit log
       is unreadable.
 
-Note: Browser history is now handled by browser_history.py module.
+  Layer 3 — psutil process scanning (no root required, always active)
+      Scans the process list every poll cycle and detects short-lived
+      commands (git status, git log, python script.py, etc.) that finish
+      too quickly for ss to catch. Uses cmdline() to reconstruct the full
+      command and deduplicates by (pid, create_time) so each execution is
+      emitted exactly once.
+
+Note: Browser history is handled by browser_history.py module.
 
 Emits:
-  • terminal_request   – Layer 1: terminal tool detected via ss
-  • terminal_command   – Layer 2: full command captured via auditd
+  • terminal_request   — Layer 1: terminal tool detected via ss
+  • terminal_command   — Layer 2: full command captured via auditd
+  • terminal_command   — Layer 3: command captured via psutil scan
 """
 
 import asyncio
@@ -54,19 +62,16 @@ SUSPICIOUS_TERMINAL_DOMAINS: Set[str] = {
     "transfer.sh", "file.io",
 }
 
-# Subset of SUSPICIOUS_TERMINAL_DOMAINS used for legacy domain_activity
 _HIGH_RISK_DOMAINS: Set[str] = {
     "chatgpt.com", "openai.com", "chegg.com", "coursehero.com",
     "brainly.com", "quizlet.com", "bartleby.com",
 }
 
-# auditd commands whose execve records we care about
 _AUDITD_TOOLS: Set[str] = {
     "curl", "wget", "git", "ssh", "python3", "python", "pip", "pip3",
     "apt", "apt-get", "nc", "ncat", "socat", "node", "npm",
 }
 
-# Risk mapping for auditd-captured commands (by tool basename)
 _AUDITD_RISK_MAP: dict = {
     "curl":    "high",
     "wget":    "high",
@@ -91,18 +96,16 @@ _AUDITD_RISK_MAP: dict = {
 
 @dataclass
 class SSConnection:
-    """Represents a connection observed via ``ss -tnp``."""
     pid: int
     tool_name: str
     remote_ip: str
     remote_host: Optional[str]
     remote_port: int
-    risk_level: str  # "high" | "medium" | "low"
+    risk_level: str
 
 
 @dataclass
 class AuditCommand:
-    """Represents a command captured from auditd EXECVE records."""
     tool_name: str
     full_command: str
     risk_level: str
@@ -114,15 +117,19 @@ class AuditCommand:
 # ---------------------------------------------------------------------------
 
 # Layer 1
-_seen_connections: Set[Tuple[int, str, int]] = set()  # (pid, remote_ip, port)
+_seen_connections: Set[Tuple[int, str, int]] = set()
 _ss_available: Optional[bool] = None
 
 # Layer 2
 _audit_file_pos: int = 0
 _audit_available: Optional[bool] = None
-_seen_audit_keys: Set[str] = set()  # dedup by (timestamp + command hash)
+_seen_audit_keys: Set[str] = set()
 
-# Reverse DNS cache (only used for ss terminal detection)
+# Layer 3 — psutil-based process scanning
+# Key: (pid, create_time_rounded) so we track each unique process execution
+_seen_psutil_keys: Set[Tuple[int, float]] = set()
+
+# Reverse DNS cache
 _SKIP_PRIVATE: Set[str] = {"127.0.0.1", "0.0.0.0", "::1", "::"}
 _IP_CACHE: dict = {}
 
@@ -132,27 +139,43 @@ _IP_CACHE: dict = {}
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _check_ss_available() -> bool:
-    """Test whether the ``ss`` command is available."""
     try:
-        subprocess.run(
-            ["ss", "--version"],
-            capture_output=True,
-            timeout=2,
-        )
+        subprocess.run(["ss", "--version"], capture_output=True, timeout=2)
         return True
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
 
 
+def _resolve_ip(ip: str) -> Optional[str]:
+    if ip in _IP_CACHE:
+        return _IP_CACHE[ip]
+    try:
+        host = socket.gethostbyaddr(ip)[0]
+        _IP_CACHE[ip] = host
+        return host
+    except Exception:
+        _IP_CACHE[ip] = None
+        return None
+
+
+def _extract_root_domain(hostname: Optional[str]) -> str:
+    if not hostname:
+        return ""
+    parts = hostname.rstrip(".").split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return hostname
+
+
+def _domain_matches_suspicious(hostname: Optional[str]) -> bool:
+    if not hostname:
+        return False
+    root = _extract_root_domain(hostname)
+    return root in SUSPICIOUS_TERMINAL_DOMAINS or hostname in SUSPICIOUS_TERMINAL_DOMAINS
+
+
 def _parse_ss_output(raw: str) -> List[SSConnection]:
-    """Parse ``ss -tnp`` output into a list of :class:`SSConnection`.
-
-    Example ss line::
-
-        ESTAB  0  0  10.0.0.5:42318  140.82.121.4:443  users:(("curl",pid=12345,fd=3))
-    """
     results: List[SSConnection] = []
-    # Regex to extract process info from the users:(...) column
     proc_re = re.compile(r'\("([^"]+)",pid=(\d+)')
 
     for line in raw.splitlines():
@@ -164,19 +187,16 @@ def _parse_ss_output(raw: str) -> List[SSConnection]:
         if len(parts) < 5:
             continue
 
-        state = parts[0]
-        if state != "ESTAB":
+        if parts[0] != "ESTAB":
             continue
 
-        # Peer address is the 5th field (index 4)
         peer = parts[4]
-        # Handle IPv6 bracket notation: [::1]:port
         if peer.startswith("["):
             bracket_end = peer.rfind("]")
             if bracket_end == -1:
                 continue
             remote_ip = peer[1:bracket_end]
-            remote_port_str = peer[bracket_end + 2:]  # skip ]:
+            remote_port_str = peer[bracket_end + 2:]
         else:
             last_colon = peer.rfind(":")
             if last_colon == -1:
@@ -189,11 +209,9 @@ def _parse_ss_output(raw: str) -> List[SSConnection]:
         except ValueError:
             continue
 
-        # Skip loopback / private ranges we don't care about
         if remote_ip in _SKIP_PRIVATE:
             continue
 
-        # Extract process info — may be in parts[5] or later
         users_str = " ".join(parts[5:])
         match = proc_re.search(users_str)
         if not match:
@@ -202,16 +220,8 @@ def _parse_ss_output(raw: str) -> List[SSConnection]:
         tool_name = match.group(1)
         pid = int(match.group(2))
 
-        # Determine risk level
-        if tool_name in MONITORED_TOOLS:
-            risk_level = "high"
-        else:
-            risk_level = "medium"
-
-        # Resolve hostname
+        risk_level = "high" if tool_name in MONITORED_TOOLS else "medium"
         remote_host = _resolve_ip(remote_ip)
-
-        # Escalate if suspicious domain
         if _domain_matches_suspicious(remote_host):
             risk_level = "high"
 
@@ -228,7 +238,6 @@ def _parse_ss_output(raw: str) -> List[SSConnection]:
 
 
 def _poll_ss() -> List[SSConnection]:
-    """Run ``ss -tnp`` and return only NEW connections since last poll."""
     global _seen_connections
 
     try:
@@ -243,11 +252,9 @@ def _poll_ss() -> List[SSConnection]:
         return []
 
     if result.returncode != 0:
-        log.debug("ss returned exit code %d", result.returncode)
         return []
 
     all_conns = _parse_ss_output(result.stdout)
-
     new_conns: List[SSConnection] = []
     current_keys: Set[Tuple[int, str, int]] = set()
 
@@ -266,7 +273,6 @@ def _poll_ss() -> List[SSConnection]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _check_audit_available() -> bool:
-    """Check whether the auditd log is readable."""
     path = config.AUDITD_LOG_PATH
     if not os.path.isfile(path):
         return False
@@ -274,7 +280,6 @@ def _check_audit_available() -> bool:
 
 
 def _init_audit_position() -> int:
-    """Seek to the end of the audit log so we only capture *new* entries."""
     try:
         return os.path.getsize(config.AUDITD_LOG_PATH)
     except OSError:
@@ -282,20 +287,11 @@ def _init_audit_position() -> int:
 
 
 def _parse_execve_args(line: str) -> Optional[str]:
-    """Reconstruct the full command from EXECVE audit record arguments.
-
-    EXECVE records contain fields like::
-
-        a0="curl" a1="https://chatgpt.com/api/..." a2="-o" a3="/dev/null"
-
-    Hex-encoded arguments (a0=6375726C) are also decoded.
-    """
     args: dict = {}
     arg_re = re.compile(r'a(\d+)=("?)([^"\s]+)"?')
     for m in arg_re.finditer(line):
         idx = int(m.group(1))
         val = m.group(3)
-        # Decode hex-encoded arguments (no quotes, all hex chars)
         if not m.group(2) and all(c in "0123456789abcdefABCDEF" for c in val) and len(val) % 2 == 0 and len(val) >= 2:
             try:
                 val = bytes.fromhex(val).decode("utf-8", errors="replace")
@@ -305,16 +301,10 @@ def _parse_execve_args(line: str) -> Optional[str]:
 
     if not args:
         return None
-
     return " ".join(args[i] for i in sorted(args))
 
 
 def _tail_audit_log() -> List[AuditCommand]:
-    """Read new lines from the auditd log since last position.
-
-    Returns a list of :class:`AuditCommand` for network-capable executables.
-    Only captures commands executed by real users (not system processes).
-    """
     global _audit_file_pos
 
     path = config.AUDITD_LOG_PATH
@@ -332,51 +322,39 @@ def _tail_audit_log() -> List[AuditCommand]:
     if not new_data:
         return commands
 
-    # Build a mapping: audit event serial → list of lines
-    # We care about type=EXECVE lines that contain our monitored tool names
     for line in new_data.splitlines():
         if "type=EXECVE" not in line:
             continue
 
-        # Skip system-initiated commands
-        # Filter out commands from cron, systemd, or other system services
         if any(skip in line.lower() for skip in [
             "exe=\"/usr/sbin/cron\"",
             "exe=\"/lib/systemd/\"",
             "exe=\"/usr/lib/systemd/\"",
-            "auid=4294967295",  # unset/unspecified audit UID (system)
+            "auid=4294967295",
         ]):
             continue
 
-        # Reconstruct command
         full_cmd = _parse_execve_args(line)
         if not full_cmd:
             continue
 
-        # Extract the tool basename
         cmd_parts = full_cmd.split()
         if not cmd_parts:
             continue
-        tool_path = cmd_parts[0]
-        tool_name = os.path.basename(tool_path)
+        tool_name = os.path.basename(cmd_parts[0])
 
         if tool_name not in _AUDITD_TOOLS:
             continue
 
-        # Dedup key — prevent firing the same command twice
         dedup_key = full_cmd.strip()
         if dedup_key in _seen_audit_keys:
             continue
         _seen_audit_keys.add(dedup_key)
 
-        # Limit the dedup set size to prevent unbounded memory growth
         if len(_seen_audit_keys) > 10000:
-            # Keep only the most recent half
             _seen_audit_keys.clear()
 
         risk = _AUDITD_RISK_MAP.get(tool_name, "medium")
-
-        # Check if any argument contains a suspicious domain
         for sus in SUSPICIOUS_TERMINAL_DOMAINS:
             if sus in full_cmd.lower():
                 risk = "high"
@@ -392,14 +370,94 @@ def _tail_audit_log() -> List[AuditCommand]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Legacy — psutil-based domain aggregation (preserved for backward compat)
+# Layer 3 — psutil process scanning (catches short-lived commands)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _poll_psutil_processes() -> List[AuditCommand]:
+    """Scan all running processes and detect monitored tool executions.
+
+    This catches commands like `git status`, `git log`, `python3 script.py`
+    that start and finish in milliseconds — far too fast for `ss` to see.
+
+    Uses (pid, create_time) as a dedup key so each unique process execution
+    fires exactly one event.
+    """
+    global _seen_psutil_keys
+
+    new_commands: List[AuditCommand] = []
+    current_keys: Set[Tuple[int, float]] = set()
+
+    try:
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time", "username"]):
+            try:
+                info = proc.info
+                name = info.get("name") or ""
+                cmdline = info.get("cmdline") or []
+                pid = info.get("pid")
+                create_time = info.get("create_time") or 0.0
+
+                if not name or not cmdline or pid is None:
+                    continue
+
+                tool_name = os.path.basename(name)
+                if tool_name not in MONITORED_TOOLS:
+                    # Also check the first element of cmdline in case the
+                    # process name is a wrapper (e.g. /usr/bin/git -> git)
+                    if cmdline:
+                        first = os.path.basename(cmdline[0])
+                        if first not in MONITORED_TOOLS:
+                            continue
+                        tool_name = first
+
+                # Round create_time to 2 decimal places to handle floating
+                # point noise across consecutive calls.
+                create_key = round(create_time, 2)
+                key = (pid, create_key)
+                current_keys.add(key)
+
+                if key in _seen_psutil_keys:
+                    continue
+
+                # Build the full command string from cmdline list
+                full_cmd = " ".join(str(a) for a in cmdline if a)
+
+                risk = _AUDITD_RISK_MAP.get(tool_name, "medium")
+                for sus in SUSPICIOUS_TERMINAL_DOMAINS:
+                    if sus in full_cmd.lower():
+                        risk = "high"
+                        break
+
+                new_commands.append(AuditCommand(
+                    tool_name=tool_name,
+                    full_command=full_cmd,
+                    risk_level=risk,
+                    timestamp=create_time,
+                ))
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+    except Exception as exc:
+        log.debug("psutil scan error: %s", exc)
+
+    # Prune keys that are no longer running to keep memory bounded.
+    # Only keep keys that are still in the current live process list.
+    _seen_psutil_keys = (_seen_psutil_keys | current_keys)
+    # Bound the set to prevent unbounded growth over long sessions.
+    if len(_seen_psutil_keys) > 20000:
+        _seen_psutil_keys = current_keys
+
+    return new_commands
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Legacy — psutil-based network info collection
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _get_interfaces() -> list:
-    """Return list of network interfaces with IP addresses."""
     interfaces: list = []
     try:
-        import netifaces  # noqa: E402
+        import netifaces
         for iface in netifaces.interfaces():
             addrs = netifaces.ifaddresses(iface)
             ipv4_list = addrs.get(netifaces.AF_INET, [])
@@ -421,7 +479,6 @@ def _get_interfaces() -> list:
 
 
 def _get_dns_servers() -> list:
-    """Parse DNS servers from /etc/resolv.conf (Linux/macOS)."""
     servers: list = []
     if platform.system() in ("Linux", "Darwin"):
         try:
@@ -438,7 +495,6 @@ def _get_dns_servers() -> list:
 
 
 def _get_active_connections() -> int:
-    """Count established TCP connections."""
     try:
         conns = psutil.net_connections(kind="tcp")
         return sum(1 for c in conns if c.status == "ESTABLISHED")
@@ -447,7 +503,6 @@ def _get_active_connections() -> int:
 
 
 def _collect_legacy() -> dict:
-    """Collect legacy network info (IP, gateway, DNS, connection count)."""
     interfaces = _get_interfaces()
     primary_ip = None
     primary_gw = None
@@ -468,30 +523,25 @@ def _collect_legacy() -> dict:
 # Event builders
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _build_ss_event(conn: SSConnection) -> dict:
-    """Build event envelope for a terminal request detected via ss.
-    
-    Only includes actual terminal tools (curl, wget, git, etc.)
-    Filters out browser-related connections.
-    """
-    # Skip if this is a browser process (not a terminal tool)
+def _build_ss_event(conn: SSConnection) -> Optional[dict]:
     browser_processes = {
-        'chrome', 'chromium', 'firefox', 'msedge', 'brave', 
+        'chrome', 'chromium', 'firefox', 'msedge', 'brave',
         'opera', 'vivaldi', 'safari', 'epiphany'
     }
     if conn.tool_name.lower() in browser_processes:
-        return None  # Don't create event for browser activity
-    
+        return None
+
     host_display = conn.remote_host or conn.remote_ip
     if conn.remote_host:
         root = _extract_root_domain(conn.remote_host)
         host_display = root
 
-    message = (
-        f"⚠️ TERMINAL REQUEST DETECTED  |  "
-        f"{conn.tool_name} → {conn.remote_ip} ({host_display}):{conn.remote_port}"
-    )
-    if conn.risk_level != "high":
+    if conn.risk_level == "high":
+        message = (
+            f"⚠️ TERMINAL REQUEST DETECTED  |  "
+            f"{conn.tool_name} → {conn.remote_ip} ({host_display}):{conn.remote_port}"
+        )
+    else:
         message = (
             f"Terminal Connection  |  "
             f"{conn.tool_name} → {conn.remote_ip} ({host_display}):{conn.remote_port}"
@@ -516,11 +566,9 @@ def _build_ss_event(conn: SSConnection) -> dict:
 
 
 def _build_audit_event(cmd: AuditCommand) -> dict:
-    """Build event envelope for a command captured via auditd."""
-    message = (
-        f"\u26a0\ufe0f TERMINAL CMD DETECTED  |  {cmd.full_command}"
-    )
-    if cmd.risk_level not in ("high",):
+    if cmd.risk_level == "high":
+        message = f"⚠️ TERMINAL CMD DETECTED  |  {cmd.full_command}"
+    else:
         message = f"Terminal Command  |  {cmd.full_command}"
 
     return {
@@ -543,24 +591,16 @@ def _build_audit_event(cmd: AuditCommand) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def run(send_fn):
-    """Long-running coroutine for comprehensive network monitoring.
-
-    *send_fn* is an ``async def send(event: dict)`` callback used to
-    dispatch events to the WebSocket layer.
-
-    Primary focus: Domain activity tracking
-    Secondary: Terminal tool detection (ss and auditd)
-    """
-    global _prev_info, _ss_available, _audit_available, _audit_file_pos
+    """Long-running coroutine for comprehensive network and terminal monitoring."""
+    global _ss_available, _audit_available, _audit_file_pos
 
     log.info("Network monitor started")
 
-    # ── Capability detection ──
     _ss_available = _check_ss_available()
     if _ss_available:
         log.info("Layer 1 (ss) — active, polling every %d s", config.NETWORK_SS_INTERVAL)
     else:
-        log.warning("Layer 1 (ss) — UNAVAILABLE, terminal connection detection disabled")
+        log.warning("Layer 1 (ss) — UNAVAILABLE")
 
     _audit_available = _check_audit_available()
     if _audit_available:
@@ -568,13 +608,16 @@ async def run(send_fn):
         log.info("Layer 2 (auditd) — active, tailing %s", config.AUDITD_LOG_PATH)
     else:
         log.warning(
-            "Layer 2 (auditd) — UNAVAILABLE, terminal command capture disabled. "
-            "Run with sudo or: sudo chmod o+r %s",
+            "Layer 2 (auditd) — UNAVAILABLE. "
+            "Run: sudo chmod o+r %s",
             config.AUDITD_LOG_PATH,
         )
 
+    log.info("Layer 3 (psutil) — active, scanning every %d s", config.NETWORK_SS_INTERVAL)
+
     last_snapshot_ts = 0.0
     last_ss_ts = 0.0
+    last_psutil_ts = 0.0
 
     while True:
         now = time.monotonic()
@@ -586,7 +629,7 @@ async def run(send_fn):
                 new_conns = await loop.run_in_executor(None, _poll_ss)
                 for conn in new_conns:
                     event = _build_ss_event(conn)
-                    if event:  # Only send if not filtered out
+                    if event:
                         await send_fn(event)
             except Exception as e:
                 log.debug("ss polling error: %s", e)
@@ -597,27 +640,38 @@ async def run(send_fn):
             try:
                 audit_cmds = await loop.run_in_executor(None, _tail_audit_log)
                 for cmd in audit_cmds:
-                    event = _build_audit_event(cmd)
-                    await send_fn(event)
+                    await send_fn(_build_audit_event(cmd))
             except Exception as e:
                 log.debug("auditd tailing error: %s", e)
 
+        # ── Layer 3: psutil process scanning ──
+        # Poll at the same cadence as ss so short-lived commands are caught.
+        if now - last_psutil_ts >= config.NETWORK_SS_INTERVAL:
+            try:
+                psutil_cmds = await loop.run_in_executor(None, _poll_psutil_processes)
+                for cmd in psutil_cmds:
+                    await send_fn(_build_audit_event(cmd))
+            except Exception as e:
+                log.debug("psutil scan error: %s", e)
+            last_psutil_ts = now
+
         # ── Network snapshot (IP info) ──
-        # Send less frequently (every 60 seconds)
-        info = await loop.run_in_executor(None, _collect_legacy)
         if now - last_snapshot_ts >= 60:
-            await send_fn({
-                "type": "network_snapshot",
-                "data": info,
-                "ts": time.time(),
-                "meta": {
-                    "risk_level": "low",
-                    "category": "network",
-                    "message": "Network info snapshot",
-                },
-            })
+            try:
+                info = await loop.run_in_executor(None, _collect_legacy)
+                await send_fn({
+                    "type": "network_snapshot",
+                    "data": info,
+                    "ts": time.time(),
+                    "meta": {
+                        "risk_level": "low",
+                        "category": "network",
+                        "message": "Network info snapshot",
+                    },
+                })
+            except Exception as e:
+                log.debug("network snapshot error: %s", e)
             last_snapshot_ts = now
 
-        # Sleep at the shorter of the two poll intervals so ss fires on time
-        sleep_interval = min(config.NETWORK_SS_INTERVAL, 5)  # At least check every 5s
+        sleep_interval = min(config.NETWORK_SS_INTERVAL, 2)
         await asyncio.sleep(sleep_interval)
