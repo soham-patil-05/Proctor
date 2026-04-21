@@ -1,4 +1,11 @@
-"""dispatcher.py — Orchestrate monitors and persist canonical events to SQLite."""
+"""dispatcher.py — Orchestrate monitors and persist canonical events to SQLite.
+
+Change in this version
+----------------------
+Browser history poll interval reduced from 30 s to 15 s.
+The scan itself takes < 50 ms per browser DB so 15 s is safe and makes
+history appear in the Network tab noticeably sooner after URLs are visited.
+"""
 
 import asyncio
 import logging
@@ -230,9 +237,13 @@ async def run(
         ``browser_history.get_new_history()`` is a blocking function that does
         disk I/O (shutil.copy2 + sqlite3 queries). It is offloaded to the
         default thread executor so the async event loop is never blocked.
+
+        Poll interval: 15 s (reduced from 30 s) — the copy+query of a single
+        browser DB takes < 50 ms, so 15 s is safe and makes history appear
+        in the Network tab noticeably sooner.
         """
         browser_history.initialize_agent_start_time()
-        log.info("Browser history monitor started")
+        log.info("Browser history monitor started (poll interval: 15 s)")
         loop = asyncio.get_event_loop()
 
         while True:
@@ -255,9 +266,8 @@ async def run(
             except Exception as exc:
                 log.error("Browser history scan error: %s", exc, exc_info=True)
 
-            # 30 s between browser scans — browser history does not need
-            # sub-second freshness and each scan does real disk I/O.
-            await asyncio.sleep(30)
+            # 15 s between browser scans — reduced from 30 s
+            await asyncio.sleep(15)
 
     async def stop_waiter():
         await stop_event.wait()

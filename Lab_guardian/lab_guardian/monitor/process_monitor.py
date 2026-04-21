@@ -1,20 +1,35 @@
 """process_monitor.py — Track running processes via psutil.
 
 Emits three event types:
-  • processes_snapshot  – full list every SNAPSHOT_INTERVAL seconds
-  • process_new         – when a new PID appears between deltas
-  • process_update      – when CPU% or mem changes beyond threshold
-  • process_end         – when a previously-seen PID disappears
+  • process_snapshot  – full list every SNAPSHOT_INTERVAL seconds
+  • process_new       – when a new PID appears between deltas
+  • process_update    – when CPU% or mem changes beyond threshold
+  • process_end       – when a previously-seen PID disappears
 
-Processes are now classified before emission:
+Processes are classified before emission:
   - SAFE       → filtered out (low priority)
   - SUSPICIOUS → risk_level = "medium", category = "suspicious"
   - DANGEROUS  → risk_level = "high",   category = "dangerous"
+  - INCOGNITO  → risk_level = "high",   category = "incognito"
   - Unknown    → included only if CPU > threshold or unknown binary
+
+Changes in this version
+-----------------------
+1. Browser child processes (renderer, GPU, utility, etc.) are now skipped so
+   only the main browser process is classified — this also fixes the case where
+   --incognito appeared on dozens of renderer PIDs.
+2. _get_proc_obj() eliminates the race between snapshot-build and proc_map-build
+   by attempting a fresh psutil.Process(pid) lookup when the cached object is dead.
+3. Firefox private-window detection now checks the sessionstore recovery file
+   (requires optional 'lz4' package; degrades gracefully when absent).
+4. _is_browser_child_process() skips renderer/gpu/utility/extension child procs.
 """
 
 import asyncio
+import glob
+import json
 import logging
+import os
 import time
 
 import psutil
@@ -27,7 +42,35 @@ log = logging.getLogger("lab_guardian.monitor.process")
 _prev_snapshot: dict[int, dict] = {}
 
 # ---------------------------------------------------------------------------
-# Process classification
+# Browser child-process detection
+# ---------------------------------------------------------------------------
+
+# Chromium-family browsers spawn child processes with --type=<value>.
+# These must NOT be classified individually — only the main browser process matters.
+_BROWSER_CHILD_TYPES = {
+    "renderer", "gpu-process", "utility", "extension",
+    "crashpad-handler", "zygote", "ppapi", "ppapi-broker",
+    "nacl-loader", "sandbox-ipc",
+}
+
+
+def _is_browser_child_process(cmdline: list) -> bool:
+    """Return True if this is a Chromium-family child/helper process.
+
+    Child processes always carry a --type=<something> flag.  The main browser
+    process either has no --type flag or has --type=browser.
+    """
+    if not cmdline:
+        return False
+    cmdline_str = " ".join(cmdline)
+    for child_type in _BROWSER_CHILD_TYPES:
+        if f"--type={child_type}" in cmdline_str:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Process classification tables
 # ---------------------------------------------------------------------------
 
 SAFE_PROCESSES = {
@@ -35,53 +78,53 @@ SAFE_PROCESSES = {
     "systemd", "systemd-journal", "systemd-udevd", "systemd-logind", "systemd-resolved",
     "systemd-timesyn", "dbus-daemon", "accounts-daemon", "udisksd", "polkitd",
     "networkmanager", "wpa_supplicant", "bluetoothd", "cron", "atd", "sshd",
-    "rsyslogd", "cupsd", "avahi-daemon", "thermald", "irqbalance", 
+    "rsyslogd", "cupsd", "avahi-daemon", "thermald", "irqbalance",
     "modemmanager", "switcheroo-control", "gdm3", "lightdm", "sddm",
-    
+
     # System processes (Windows)
-    "svchost", "csrss", "dwm", "winlogon", "lsass", "services", "smss", 
-    "wininit", "taskhost", "taskhostw", "spoolsv", "searchindexer", 
-    "searchprotocolhost", "searchfilterhost", "runtimebroker", 
+    "svchost", "csrss", "dwm", "winlogon", "lsass", "services", "smss",
+    "wininit", "taskhost", "taskhostw", "spoolsv", "searchindexer",
+    "searchprotocolhost", "searchfilterhost", "runtimebroker",
     "shellexperiencehost", "sihost", "ctfmon", "fontdrvhost", "dllhost",
     "lsaiso", "wmiprvse", "conhost", "compattelrunner", "moone",
-    
-    # File managers/DE (safe but we want to track browsers separately)
+
+    # File managers / DE
     "explorer", "nautilus", "dolphin", "thunar", "xfce4-panel", "gnome-shell",
 }
 
 SUSPICIOUS_PROCESSES = {
-    # Web Browsers (important to track)
+    # Web Browsers
     "chrome", "google-chrome", "chromium", "chromium-browser",
-    "firefox", "firefox-esr", 
+    "firefox", "firefox-esr",
     "msedge", "microsoft-edge",
     "brave", "brave-browser",
     "opera", "opera-browser",
     "vivaldi", "vivaldi-stable",
     "safari", "epiphany", "midori",
-    
-    # Communication apps (can be used for cheating)
-    "zoom", "microsoft teams", "teams", "skype", 
+
+    # Communication apps
+    "zoom", "microsoft teams", "teams", "skype",
     "discord", "telegram", "whatsapp", "signal",
     "slack", "webex", "gotomeeting",
-    
+
     # Terminal emulators (suspicious but not always dangerous)
     "terminal", "iterm", "iterm2", "wsl", "wslhost",
-    
-    # IDEs and Code Editors (important to track)
-    "code", "code-insiders", "code-oss",  # VS Code
+
+    # IDEs and Code Editors
+    "code", "code-insiders", "code-oss",
     "sublime_text", "atom", "gedit", "nano", "vim", "vi",
-    
+
     # Development tools
     "java", "javac", "gcc", "g++", "clang", "clangd",
     "docker", "docker-compose", "containerd",
 }
 
 DANGEROUS_PROCESSES = {
-    # Remote access tools (high risk during exams)
+    # Remote access tools
     "anydesk", "teamviewer", "rustdesk", "parsec",
     "vnc", "vncserver", "vncviewer", "remotedesktop",
-    
-    # Terminal processes (only flag if actively used)
+
+    # Shells
     "bash", "zsh", "fish", "ksh", "csh", "sh",
     "powershell", "pwsh", "cmd", "command",
     "mintty", "xterm", "konsole", "gnome-terminal",
@@ -89,7 +132,6 @@ DANGEROUS_PROCESSES = {
     "wt", "windowsterminal",
 }
 
-# Human-readable labels for known process names
 PROCESS_LABELS = {
     "anydesk": "AnyDesk Remote Access",
     "teamviewer": "TeamViewer Remote Access",
@@ -150,49 +192,180 @@ UNKNOWN_CPU_THRESHOLD = 5.0
 
 # Incognito/Private browsing indicators in command line
 INCOGNITO_FLAGS = {
-    "--incognito", "-incognito",  # Chrome
-    "--private", "-private", "-private-window",  # Firefox
-    "--inprivate", "-inprivate",  # Edge
-    "--private-browsing",  # Safari
+    "--incognito", "-incognito",          # Chrome / Chromium
+    "--private", "-private",              # Firefox (CLI launch)
+    "--private-window", "-private-window",  # Firefox (CLI launch, newer)
+    "--inprivate", "-inprivate",          # Edge
+    "--private-browsing",                 # Safari
 }
 
+# ---------------------------------------------------------------------------
+# Process object helper — eliminates race between snapshot and proc_map build
+# ---------------------------------------------------------------------------
+
+def _get_proc_obj(pid: int, proc_map: dict) -> "psutil.Process | None":
+    """Return a live psutil.Process for *pid*, using *proc_map* as a cache.
+
+    The snapshot dict and the proc_map are built in two separate
+    psutil.process_iter() passes.  Between those two passes a process may have
+    exited, leaving a dead object in proc_map.  This function tests liveness
+    and falls back to a fresh psutil.Process(pid) lookup before giving up.
+    """
+    cached = proc_map.get(pid) if proc_map else None
+    if cached is not None:
+        try:
+            cached.cmdline()   # cheap liveness probe
+            return cached
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+    # Fallback: fresh lookup
+    try:
+        return psutil.Process(pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Incognito / private-window detection
+# ---------------------------------------------------------------------------
 
 def _check_incognito(proc) -> bool:
-    """Check if a browser process is running in incognito/private mode."""
+    """Return True if the browser process is running in incognito/private mode.
+
+    Only examines the MAIN browser process.  Child processes (renderer, GPU,
+    utility …) carry the same --incognito flag but should not be flagged
+    individually — _is_browser_child_process() filters them out earlier in
+    _classify_process().
+    """
     try:
         cmdline = proc.cmdline()
         if not cmdline:
             return False
-        
-        # Check if any command line argument matches incognito flags
+
+        # Skip browser child/helper processes
+        if _is_browser_child_process(cmdline):
+            return False
+
         cmdline_str = " ".join(cmdline).lower()
         for flag in INCOGNITO_FLAGS:
             if flag in cmdline_str:
                 return True
         return False
-    except (psutil.AccessDenied, psutil.NoSuchProcess):
+    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
         return False
 
+
+def _check_firefox_private_window() -> bool:
+    """Detect a live Firefox private window via the sessionstore recovery file.
+
+    When the user opens a private window from inside an already-running Firefox,
+    the --private-window flag only appears on a short-lived helper process that
+    exits immediately — the main Firefox process never shows it in cmdline.
+
+    The only reliable OS-level signal is Firefox's own sessionstore file:
+      ~/.mozilla/firefox/<profile>/sessionstore-backups/recovery.jsonlz4
+
+    This file uses Mozilla's custom LZ4 framing (magic "mozLz40\\0" + 4-byte
+    uncompressed length + raw LZ4 block).  We decompress it with the optional
+    lz4 package (lz4.block.decompress with unframed=False after stripping the
+    8-byte Mozilla header).
+
+    Returns True  — private window confirmed.
+    Returns False — no private window, lz4 unavailable, or any error.
+    Fails silently in all error cases.
+    """
+    profile_patterns = [
+        os.path.expanduser("~/.mozilla/firefox/*/sessionstore-backups/recovery.jsonlz4"),
+        os.path.expanduser("~/snap/firefox/common/.mozilla/firefox/*/sessionstore-backups/recovery.jsonlz4"),
+        os.path.expanduser("~/snap/firefox/current/.mozilla/firefox/*/sessionstore-backups/recovery.jsonlz4"),
+        os.path.expanduser("~/AppData/Roaming/Mozilla/Firefox/Profiles/*/sessionstore-backups/recovery.jsonlz4"),
+    ]
+
+    try:
+        import lz4.block as _lz4_block
+    except ImportError:
+        # lz4 not installed — degraded mode, cannot check sessionstore
+        log.debug("lz4 not available; Firefox sessionstore private-window check skipped")
+        return False
+
+    for pattern in profile_patterns:
+        for path in glob.glob(pattern):
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+
+                # Mozilla LZ4 framing: 8-byte magic + 4-byte uncompressed length
+                # (little-endian) + raw LZ4 block data.
+                MAGIC = b"mozLz40\x00"
+                if not raw.startswith(MAGIC):
+                    continue
+
+                # The 4 bytes after the magic are the uncompressed size (uint32 LE).
+                import struct
+                uncompressed_size = struct.unpack_from("<I", raw, len(MAGIC))[0]
+                compressed_payload = raw[len(MAGIC) + 4:]
+
+                data = _lz4_block.decompress(
+                    compressed_payload,
+                    uncompressed_size=uncompressed_size,
+                )
+                state = json.loads(data.decode("utf-8", errors="replace"))
+
+                for window in state.get("windows", []):
+                    if window.get("isPrivate"):
+                        log.info("Firefox private window detected via sessionstore: %s", path)
+                        return True
+
+            except Exception as exc:
+                log.debug("sessionstore check failed for %s: %s", path, exc)
+                continue
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
 
 def _classify_process(proc_info: dict, proc_obj=None) -> dict | None:
     """Classify a process and enrich with risk_level, category, label.
 
-    Returns None if the process should be filtered out (safe / low priority).
-    Returns the enriched dict otherwise.
+    Returns None  → process should be filtered out (safe / low priority).
+    Returns dict  → enriched proc_info ready for emission.
     """
     name_lower = (proc_info.get("name") or "").lower()
 
-    # Check for incognito/private browsing
+    # ── Step 1: skip browser child/helper processes entirely ─────────────────
+    # Chromium spawns dozens of renderer/GPU/utility child processes that all
+    # appear under the same binary name.  Classifying each one independently
+    # would flood the process list and cause duplicate incognito alerts.
+    if proc_obj is not None:
+        try:
+            cmdline = proc_obj.cmdline()
+            if _is_browser_child_process(cmdline):
+                return None
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+
+    # ── Step 2: incognito / private-window detection ─────────────────────────
     is_incognito = False
-    if proc_obj:
+    if proc_obj is not None:
         is_incognito = _check_incognito(proc_obj)
-    
+
+    # Firefox: also check sessionstore for private windows opened from the menu
+    if not is_incognito and name_lower in {"firefox", "firefox-esr"}:
+        is_incognito = _check_firefox_private_window()
+
     if is_incognito:
         proc_info["risk_level"] = "high"
         proc_info["category"] = "incognito"
         proc_info["label"] = f"{proc_info.get('name', 'Browser')} (Incognito/Private Mode)"
         proc_info["is_incognito"] = True
         return proc_info
+
+    # ── Step 3: standard classification ──────────────────────────────────────
 
     # Safe processes → skip
     if name_lower in SAFE_PROCESSES:
@@ -201,7 +374,6 @@ def _classify_process(proc_info: dict, proc_obj=None) -> dict | None:
     if name_lower in DANGEROUS_PROCESSES:
         proc_info["risk_level"] = "high"
         proc_info["category"] = "dangerous"
-        # Use the actual process name from PROCESS_LABELS or fallback to the name
         proc_info["label"] = PROCESS_LABELS.get(name_lower, proc_info.get("name", "Unknown Process"))
         return proc_info
 
@@ -219,7 +391,6 @@ def _classify_process(proc_info: dict, proc_obj=None) -> dict | None:
         proc_info["label"] = proc_info.get("name", "Unknown Process")
         return proc_info
 
-    # Low CPU unknown process → skip
     return None
 
 
@@ -236,62 +407,62 @@ def _make_meta(proc_info: dict, msg_override: str | None = None) -> dict:
 # Snapshot helpers
 # ---------------------------------------------------------------------------
 
-def _take_snapshot() -> dict[int, dict]:
-    """Return dict of {pid: info} for all running user processes.
-    
+def _take_snapshot() -> tuple[dict[int, dict], dict[int, "psutil.Process"]]:
+    """Return (pid_info_dict, pid_proc_obj_dict) for all running user processes.
+
+    Both dicts are built in a SINGLE psutil.process_iter() pass to eliminate
+    the race condition that previously existed when the two dicts were built in
+    separate passes.
+
     Filters out:
-    - System processes (root/system on Linux, SYSTEM/NETWORK SERVICE on Windows)
+    - System processes (root/SYSTEM/NETWORK SERVICE)
     - Processes with very low CPU and memory usage
     """
     import getpass
-    import os
-    
+
     procs: dict[int, dict] = {}
+    proc_map: dict[int, psutil.Process] = {}
+
     current_user = None
     try:
         current_user = getpass.getuser()
-    except:
+    except Exception:
         pass
-    
-    for proc in psutil.process_iter(["pid", "name", "username", "cpu_percent", "memory_info", "status", "create_time"]):
+
+    attrs = ["pid", "name", "username", "cpu_percent", "memory_info", "status", "create_time"]
+
+    for proc in psutil.process_iter(attrs):
         try:
             info = proc.info
-            
-            # Skip if we can't get the username
+
             if not info.get("username"):
                 continue
-            
+
             username = info["username"] or ""
-            
-            # Filter out system processes
-            # Linux: skip root processes (except current user)
-            # Windows: skip SYSTEM, NETWORK SERVICE, LOCAL SERVICE
+
             if username.lower() in ["root", "system", "network service", "local service"]:
-                # Allow if it's actually the current user running as root
                 if current_user and current_user.lower() != "root":
                     continue
-            
-            # Skip processes with very low resource usage (likely background)
+
             cpu = round(info["cpu_percent"] or 0.0, 2)
-            memory_mb = round((info["memory_info"].rss if info["memory_info"] else 0) / (1024 * 1024), 2)
-            
-            # Only include if:
-            # 1. Has notable CPU usage (> 0.5%) - lowered from 1%
-            # 2. Or uses significant memory (> 30MB) - lowered from 50MB
-            # 3. Or is a known suspicious/dangerous process (browsers, terminals, etc.)
+            memory_mb = round(
+                (info["memory_info"].rss if info["memory_info"] else 0) / (1024 * 1024), 2
+            )
+
             name_lower = (info["name"] or "").lower()
             is_notable = (
-                cpu > 0.5 or 
-                memory_mb > 30.0 or
-                name_lower in DANGEROUS_PROCESSES or
-                name_lower in SUSPICIOUS_PROCESSES
+                cpu > 0.5
+                or memory_mb > 30.0
+                or name_lower in DANGEROUS_PROCESSES
+                or name_lower in SUSPICIOUS_PROCESSES
             )
-            
+
             if not is_notable:
                 continue
-            
-            procs[info["pid"]] = {
-                "pid": info["pid"],
+
+            pid = info["pid"]
+            procs[pid] = {
+                "pid": pid,
                 "name": info["name"] or "unknown",
                 "user": username,
                 "cpu": cpu,
@@ -299,23 +470,35 @@ def _take_snapshot() -> dict[int, dict]:
                 "status": info["status"] or "unknown",
                 "started_at": info["create_time"],
             }
+            # Store the live process object in the same pass — no race.
+            proc_map[pid] = proc
+
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
-    return procs
+
+    return procs, proc_map
 
 
-def _filter_and_classify(snapshot: dict[int, dict], proc_map: dict[int, any] = None) -> list[dict]:
+def _filter_and_classify(
+    snapshot: dict[int, dict],
+    proc_map: dict[int, "psutil.Process"] | None = None,
+) -> list[dict]:
     """Apply classification filter and return only relevant processes."""
     result = []
-    for pid, proc in snapshot.items():
-        proc_obj = proc_map.get(pid) if proc_map else None
-        classified = _classify_process(dict(proc), proc_obj)  # copy so we don't mutate state
+    for pid, proc_data in snapshot.items():
+        proc_obj = _get_proc_obj(pid, proc_map)
+        classified = _classify_process(dict(proc_data), proc_obj)
         if classified is not None:
             result.append(classified)
     return result
 
 
-def _diff(prev: dict[int, dict], curr: dict[int, dict], prev_map: dict = None, curr_map: dict = None) -> list[dict]:
+def _diff(
+    prev: dict[int, dict],
+    curr: dict[int, dict],
+    prev_map: dict | None = None,
+    curr_map: dict | None = None,
+) -> list[dict]:
     """Compute delta events between two snapshots (with classification)."""
     events: list[dict] = []
 
@@ -323,7 +506,7 @@ def _diff(prev: dict[int, dict], curr: dict[int, dict], prev_map: dict = None, c
     gone_pids = set(prev) - set(curr)
 
     for pid in new_pids:
-        proc_obj = curr_map.get(pid) if curr_map else None
+        proc_obj = _get_proc_obj(pid, curr_map)
         classified = _classify_process(dict(curr[pid]), proc_obj)
         if classified is not None:
             events.append({
@@ -334,7 +517,8 @@ def _diff(prev: dict[int, dict], curr: dict[int, dict], prev_map: dict = None, c
 
     for pid in gone_pids:
         prev_proc = prev[pid]
-        proc_obj = prev_map.get(pid) if prev_map else None
+        # Ended processes are already gone — proc_obj will be None; that is fine.
+        proc_obj = _get_proc_obj(pid, prev_map)
         classified = _classify_process(dict(prev_proc), proc_obj)
         if classified is not None:
             events.append({
@@ -348,7 +532,7 @@ def _diff(prev: dict[int, dict], curr: dict[int, dict], prev_map: dict = None, c
         cpu_delta = abs(c["cpu"] - p["cpu"])
         mem_delta = abs(c["memory"] - p["memory"])
         if cpu_delta >= config.CPU_CHANGE_THRESHOLD or mem_delta >= config.MEM_CHANGE_THRESHOLD:
-            proc_obj = curr_map.get(pid) if curr_map else None
+            proc_obj = _get_proc_obj(pid, curr_map)
             classified = _classify_process(dict(c), proc_obj)
             if classified is not None:
                 events.append({
@@ -360,36 +544,35 @@ def _diff(prev: dict[int, dict], curr: dict[int, dict], prev_map: dict = None, c
     return events
 
 
+# ---------------------------------------------------------------------------
+# Main monitor coroutine
+# ---------------------------------------------------------------------------
+
 async def run(send_fn):
     """Long-running coroutine that monitors processes.
 
     *send_fn* is an ``async def send(event: dict)`` callback used to
-    dispatch events to the WebSocket layer.
+    dispatch events to the local DB layer.
     """
     global _prev_snapshot
 
     log.info("Process monitor started")
     last_snapshot_ts = 0.0
-    proc_map = {}  # Keep track of process objects for incognito detection
+    prev_proc_map: dict[int, psutil.Process] = {}
 
     while True:
         now = time.monotonic()
-        curr = _take_snapshot()
-        
-        # Build a map of current process objects for incognito detection
-        curr_proc_map = {}
-        for proc in psutil.process_iter(["pid", "name"]):
-            try:
-                curr_proc_map[proc.info["pid"]] = proc
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
+
+        # _take_snapshot() now builds BOTH the data dict and the proc_map in a
+        # single psutil.process_iter() pass — eliminates the previous race.
+        curr, curr_proc_map = _take_snapshot()
 
         # Full snapshot on first run or every SNAPSHOT_INTERVAL
         if now - last_snapshot_ts >= config.SNAPSHOT_INTERVAL or not _prev_snapshot:
             filtered = _filter_and_classify(curr, curr_proc_map)
 
             high_count = sum(1 for p in filtered if p.get("risk_level") == "high")
-            med_count = sum(1 for p in filtered if p.get("risk_level") == "medium")
+            med_count  = sum(1 for p in filtered if p.get("risk_level") == "medium")
             overall_risk = "high" if high_count > 0 else ("medium" if med_count > 0 else "low")
 
             await send_fn({
@@ -404,13 +587,12 @@ async def run(send_fn):
             })
             last_snapshot_ts = now
         else:
-            # Delta events
-            prev_proc_map = proc_map.copy()
+            # Delta events — use prev_proc_map for gone PIDs, curr_proc_map for new ones
             deltas = _diff(_prev_snapshot, curr, prev_proc_map, curr_proc_map)
             for evt in deltas:
                 evt["ts"] = time.time()
                 await send_fn(evt)
 
         _prev_snapshot = curr
-        proc_map = curr_proc_map
+        prev_proc_map = curr_proc_map
         await asyncio.sleep(config.DELTA_INTERVAL)

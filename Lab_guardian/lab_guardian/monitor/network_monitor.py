@@ -10,6 +10,8 @@ Three detection layers run concurrently:
       Parses EXECVE audit records to capture full command + arguments for
       network-capable executables.  Skipped gracefully when the audit log
       is unreadable.
+      Also handles log rotation: if the file shrinks (rotated), the read
+      position is reset to 0 automatically.
 
   Layer 3 — psutil process scanning (no root required, always active)
       Scans the process list every poll cycle and detects short-lived
@@ -24,9 +26,33 @@ Emits:
   • terminal_request   — Layer 1: terminal tool detected via ss
   • terminal_command   — Layer 2: full command captured via auditd
   • terminal_command   — Layer 3: command captured via psutil scan
+
+Changes in this version
+-----------------------
+1. Layer 3 now filters by username — only events from the current user are
+   emitted.  System-owned processes (root, www-data, daemon, etc.) are
+   silently skipped.
+
+2. SYSTEM_CMD_PATTERNS blocklist — Layer 3 skips commands whose path or
+   arguments match known system-maintenance patterns (update-manager, apport,
+   dpkg, unattended-upgrade, etc.).
+
+3. PSUTIL_MONITORED_TOOLS — Layer 3 uses a separate set that excludes
+   apt/apt-get.  Package managers generate near-100% system noise in a lab
+   environment.  Layer 1 and Layer 2 keep apt/apt-get in their own sets.
+
+4. Minimum argument filter — bare interpreter invocations (python3 with no
+   script) are skipped; ssh with no arguments IS still emitted (suspicious).
+
+5. Dedup set caps reduced: _seen_audit_keys 10 000 → 2 000;
+   _seen_psutil_keys 20 000 → 2 000.
+
+6. Auditd log-rotation resilience: if current file size < _audit_file_pos,
+   the position is reset to 0 so we don't miss new entries after rotation.
 """
 
 import asyncio
+import getpass
 import logging
 import os
 import platform
@@ -34,7 +60,6 @@ import re
 import socket
 import subprocess
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple
 
@@ -45,13 +70,74 @@ from .. import config
 log = logging.getLogger("lab_guardian.monitor.network")
 
 # ---------------------------------------------------------------------------
-# Constants
+# Current-user identification (computed once at module load)
 # ---------------------------------------------------------------------------
 
+def _get_current_user() -> str:
+    try:
+        return getpass.getuser().lower()
+    except Exception:
+        return ""
+
+_CURRENT_USER: str = _get_current_user()
+
+# Accounts whose processes should NEVER generate terminal events
+_SYSTEM_USERS: frozenset = frozenset({
+    "root", "system", "network service", "local service", "daemon",
+    "www-data", "nobody", "messagebus", "syslog", "_apt", "man",
+    "landscape", "pollinate", "uuidd", "sshd", "systemd-resolve",
+    "systemd-network", "systemd-timesync", "ntp", "avahi", "colord",
+    "rtkit", "speech-dispatcher", "kernoops", "cups-pk-helper",
+    "whoopsie", "hplip", "geoclue", "gnome-initial-setup",
+})
+
+# ---------------------------------------------------------------------------
+# Tool sets
+# ---------------------------------------------------------------------------
+
+# Layer 1 (ss) + Layer 2 (auditd) — unchanged, keeps apt/apt-get
 MONITORED_TOOLS: Set[str] = {
     "curl", "wget", "git", "python", "python3", "pip", "pip3",
     "apt", "apt-get", "ssh", "nc", "ncat", "socat", "node", "npm",
 }
+
+# Layer 3 (psutil) — excludes package managers (system noise in lab)
+PSUTIL_MONITORED_TOOLS: Set[str] = {
+    "curl", "wget", "git", "python", "python3", "pip", "pip3",
+    "ssh", "nc", "ncat", "socat", "node", "npm",
+}
+
+# ---------------------------------------------------------------------------
+# System command path blocklist (Layer 3 only)
+# ---------------------------------------------------------------------------
+
+# If the full command string contains ANY of these substrings (case-sensitive),
+# the event is silently dropped.  These are well-known system-maintenance
+# invocations that carry zero academic-integrity signal.
+SYSTEM_CMD_PATTERNS: Tuple[str, ...] = (
+    "/usr/lib/update-manager/",
+    "/usr/share/apport/",
+    "/usr/lib/gnome-",
+    "/usr/lib/apt/",
+    "/usr/lib/packagekit/",
+    "/usr/bin/dpkg",
+    "/usr/sbin/",
+    "check-new-release",
+    "unattended-upgrade",
+    "apt-get update",
+    "apt-get -q",
+    "apt list",
+    "/usr/lib/python3/dist-packages/",
+    "/usr/share/ubuntu-advantage-tools/",
+    "/usr/lib/ubuntu-advantage/",
+    "/usr/bin/ubuntu-advantage",
+    "/snap/core",
+    "snap refresh",
+)
+
+# ---------------------------------------------------------------------------
+# Suspicious domain sets
+# ---------------------------------------------------------------------------
 
 SUSPICIOUS_TERMINAL_DOMAINS: Set[str] = {
     "chatgpt.com", "openai.com", "gemini.google.com", "bard.google.com",
@@ -125,8 +211,7 @@ _audit_file_pos: int = 0
 _audit_available: Optional[bool] = None
 _seen_audit_keys: Set[str] = set()
 
-# Layer 3 — psutil-based process scanning
-# Key: (pid, create_time_rounded) so we track each unique process execution
+# Layer 3
 _seen_psutil_keys: Set[Tuple[int, float]] = set()
 
 # Reverse DNS cache
@@ -292,7 +377,12 @@ def _parse_execve_args(line: str) -> Optional[str]:
     for m in arg_re.finditer(line):
         idx = int(m.group(1))
         val = m.group(3)
-        if not m.group(2) and all(c in "0123456789abcdefABCDEF" for c in val) and len(val) % 2 == 0 and len(val) >= 2:
+        if (
+            not m.group(2)
+            and all(c in "0123456789abcdefABCDEF" for c in val)
+            and len(val) % 2 == 0
+            and len(val) >= 2
+        ):
             try:
                 val = bytes.fromhex(val).decode("utf-8", errors="replace")
             except (ValueError, UnicodeDecodeError):
@@ -309,6 +399,16 @@ def _tail_audit_log() -> List[AuditCommand]:
 
     path = config.AUDITD_LOG_PATH
     commands: List[AuditCommand] = []
+
+    # Log-rotation resilience: if the file is smaller than our saved position,
+    # the log was rotated — reset to start of the new file.
+    try:
+        current_size = os.path.getsize(path)
+        if current_size < _audit_file_pos:
+            log.info("auditd log rotation detected; resetting read position to 0")
+            _audit_file_pos = 0
+    except OSError:
+        pass
 
     try:
         with open(path, "r", errors="replace") as f:
@@ -351,7 +451,8 @@ def _tail_audit_log() -> List[AuditCommand]:
             continue
         _seen_audit_keys.add(dedup_key)
 
-        if len(_seen_audit_keys) > 10000:
+        # Reduced cap: 2 000 is ample for a 3-hour exam session
+        if len(_seen_audit_keys) > 2000:
             _seen_audit_keys.clear()
 
         risk = _AUDITD_RISK_MAP.get(tool_name, "medium")
@@ -374,13 +475,14 @@ def _tail_audit_log() -> List[AuditCommand]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _poll_psutil_processes() -> List[AuditCommand]:
-    """Scan all running processes and detect monitored tool executions.
+    """Scan all running processes and detect student-owned monitored tool executions.
 
-    This catches commands like `git status`, `git log`, `python3 script.py`
-    that start and finish in milliseconds — far too fast for `ss` to see.
-
-    Uses (pid, create_time) as a dedup key so each unique process execution
-    fires exactly one event.
+    Improvements over the previous version:
+    - Only emits events for processes owned by the current user (not root/system).
+    - Skips commands matching SYSTEM_CMD_PATTERNS (update-manager, apport, etc.).
+    - Uses PSUTIL_MONITORED_TOOLS (no apt/apt-get) to avoid package-manager noise.
+    - Skips bare interpreter invocations with no arguments (system helpers).
+    - Dedup set cap reduced from 20 000 to 2 000.
     """
     global _seen_psutil_keys
 
@@ -391,26 +493,43 @@ def _poll_psutil_processes() -> List[AuditCommand]:
         for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time", "username"]):
             try:
                 info = proc.info
-                name = info.get("name") or ""
-                cmdline = info.get("cmdline") or []
-                pid = info.get("pid")
+                name        = info.get("name") or ""
+                cmdline     = info.get("cmdline") or []
+                pid         = info.get("pid")
                 create_time = info.get("create_time") or 0.0
+                username    = (info.get("username") or "").lower()
 
                 if not name or not cmdline or pid is None:
                     continue
 
+                # ── Username filter ──────────────────────────────────────────
+                # Skip processes owned by known system accounts.
+                if username in _SYSTEM_USERS:
+                    continue
+                # Only emit events for the current interactive user.
+                # If we can't determine the current user, allow all non-system users.
+                if _CURRENT_USER and username and username != _CURRENT_USER:
+                    continue
+
+                # ── Tool name filter ─────────────────────────────────────────
                 tool_name = os.path.basename(name)
-                if tool_name not in MONITORED_TOOLS:
-                    # Also check the first element of cmdline in case the
-                    # process name is a wrapper (e.g. /usr/bin/git -> git)
+                if tool_name not in PSUTIL_MONITORED_TOOLS:
+                    # Also check the first cmdline element (wrapper scripts)
                     if cmdline:
                         first = os.path.basename(cmdline[0])
-                        if first not in MONITORED_TOOLS:
+                        if first not in PSUTIL_MONITORED_TOOLS:
                             continue
                         tool_name = first
 
-                # Round create_time to 2 decimal places to handle floating
-                # point noise across consecutive calls.
+                # ── Minimum argument filter ──────────────────────────────────
+                # Bare interpreter calls (python3 with no script) are almost
+                # always system helpers.  ssh/nc/curl with zero args are
+                # unusual enough to flag — keep them.
+                if tool_name in {"python", "python3", "node", "perl", "ruby", "pip", "pip3"} \
+                        and len(cmdline) < 2:
+                    continue
+
+                # ── Dedup ────────────────────────────────────────────────────
                 create_key = round(create_time, 2)
                 key = (pid, create_key)
                 current_keys.add(key)
@@ -418,9 +537,16 @@ def _poll_psutil_processes() -> List[AuditCommand]:
                 if key in _seen_psutil_keys:
                     continue
 
-                # Build the full command string from cmdline list
+                # ── Build full command string ────────────────────────────────
                 full_cmd = " ".join(str(a) for a in cmdline if a)
 
+                # ── System command path filter ───────────────────────────────
+                if any(pat in full_cmd for pat in SYSTEM_CMD_PATTERNS):
+                    # Still track the key so we don't re-evaluate this process
+                    _seen_psutil_keys.add(key)
+                    continue
+
+                # ── Risk classification ──────────────────────────────────────
                 risk = _AUDITD_RISK_MAP.get(tool_name, "medium")
                 for sus in SUSPICIOUS_TERMINAL_DOMAINS:
                     if sus in full_cmd.lower():
@@ -440,11 +566,10 @@ def _poll_psutil_processes() -> List[AuditCommand]:
     except Exception as exc:
         log.debug("psutil scan error: %s", exc)
 
-    # Prune keys that are no longer running to keep memory bounded.
-    # Only keep keys that are still in the current live process list.
-    _seen_psutil_keys = (_seen_psutil_keys | current_keys)
-    # Bound the set to prevent unbounded growth over long sessions.
-    if len(_seen_psutil_keys) > 20000:
+    # Merge current keys into seen set; cap at 2 000 to bound memory usage.
+    _seen_psutil_keys = _seen_psutil_keys | current_keys
+    if len(_seen_psutil_keys) > 2000:
+        # Keep only the keys still alive in this scan cycle.
         _seen_psutil_keys = current_keys
 
     return new_commands
@@ -526,7 +651,7 @@ def _collect_legacy() -> dict:
 def _build_ss_event(conn: SSConnection) -> Optional[dict]:
     browser_processes = {
         'chrome', 'chromium', 'firefox', 'msedge', 'brave',
-        'opera', 'vivaldi', 'safari', 'epiphany'
+        'opera', 'vivaldi', 'safari', 'epiphany',
     }
     if conn.tool_name.lower() in browser_processes:
         return None
@@ -594,7 +719,7 @@ async def run(send_fn):
     """Long-running coroutine for comprehensive network and terminal monitoring."""
     global _ss_available, _audit_available, _audit_file_pos
 
-    log.info("Network monitor started")
+    log.info("Network monitor started (current user: %s)", _CURRENT_USER or "<unknown>")
 
     _ss_available = _check_ss_available()
     if _ss_available:
@@ -645,7 +770,6 @@ async def run(send_fn):
                 log.debug("auditd tailing error: %s", e)
 
         # ── Layer 3: psutil process scanning ──
-        # Poll at the same cadence as ss so short-lived commands are caught.
         if now - last_psutil_ts >= config.NETWORK_SS_INTERVAL:
             try:
                 psutil_cmds = await loop.run_in_executor(None, _poll_psutil_processes)
