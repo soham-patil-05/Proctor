@@ -3,6 +3,7 @@
 import asyncio
 import errno
 import json
+import logging
 import os
 import socket
 import threading
@@ -14,6 +15,11 @@ from urllib.parse import urlparse
 import requests
 
 from . import config, db, dispatcher
+
+log = logging.getLogger("lab_guardian.gui")
+
+# Refresh interval: how often the UI re-reads from SQLite (milliseconds).
+_UI_REFRESH_MS = 5000
 
 
 class MonitorRuntime:
@@ -33,7 +39,9 @@ class MonitorRuntime:
             self.stop_event = asyncio.Event()
             self.running = True
             try:
-                self.loop.run_until_complete(dispatcher.run(session_id, roll_no, lab_no, self.stop_event))
+                self.loop.run_until_complete(
+                    dispatcher.run(session_id, roll_no, lab_no, self.stop_event)
+                )
             finally:
                 self.running = False
                 self.loop.close()
@@ -115,15 +123,34 @@ class LabGuardianGUI:
 
         self.start_status_var = tk.StringVar(value="")
         self.status_bar_var = tk.StringVar(value="Ready")
-        self.displayed_rowids = {
+
+        # Tracks which DB rowids have already been inserted into each tree so
+        # we only call tree.insert() for genuinely new rows.
+        self.displayed_rowids: dict[str, set] = {
             "devices": set(),
             "browserHistory": set(),
             "processes": set(),
             "terminalEvents": set(),
         }
 
+        # Per-rowid checksum cache for the Network tab so we can detect when
+        # visit_count / last_visited changed without doing a full repaint.
+        # key: rowid  value: (visit_count, last_visited)
+        self._browser_row_cache: dict[int, tuple] = {}
+
+        # Tkinter item IDs for browser tree rows, keyed by DB rowid.
+        # Needed so we can update values in-place instead of delete+reinsert.
+        self._browser_tree_items: dict[int, str] = {}
+
+        # Flag that prevents re-entrant refresh triggers.
+        self._refresh_pending = False
+
         self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # -------------------------------------------------------------------------
+    # Theme and layout helpers
+    # -------------------------------------------------------------------------
 
     def _apply_theme(self):
         style = ttk.Style(self.root)
@@ -131,25 +158,18 @@ class LabGuardianGUI:
 
         style.configure("TFrame", background="#FFFFFF")
         style.configure("TLabel", background="#FFFFFF")
-
         style.configure("Card.TFrame", background="#FFFFFF")
-
         style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"), foreground="#1A237E")
         style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground="#546E7A")
         style.configure("FieldLabel.TLabel", font=("Segoe UI", 9), foreground="#37474F")
-
         style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(24, 8), foreground="#FFFFFF", background="#1565C0")
         style.map("Primary.TButton", background=[("active", "#0D47A1")])
-
         style.configure("Secondary.TButton", font=("Segoe UI", 10), padding=(20, 6), foreground="#1565C0", background="#FFFFFF", borderwidth=1)
         style.map("Secondary.TButton", background=[("active", "#E3F2FD")])
-
         style.configure("Danger.TButton", font=("Segoe UI", 10, "bold"), padding=(16, 6), foreground="#FFFFFF", background="#C62828")
         style.map("Danger.TButton", background=[("active", "#B71C1C")])
-
         style.configure("Neutral.TButton", font=("Segoe UI", 10), padding=(16, 6), foreground="#263238", background="#CFD8DC")
         style.map("Neutral.TButton", background=[("active", "#B0BEC5")])
-
         style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
     def _try_set_icon(self):
@@ -208,7 +228,10 @@ class LabGuardianGUI:
         self.progress.grid_remove()
 
         row += 1
-        self.start_status_label = tk.Label(card, textvariable=self.start_status_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9))
+        self.start_status_label = tk.Label(
+            card, textvariable=self.start_status_var,
+            bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)
+        )
         self.start_status_label.grid(row=row, column=0, sticky="w", pady=(8, 0))
 
     def _tree_with_scroll(self, parent, columns, headings):
@@ -226,9 +249,9 @@ class LabGuardianGUI:
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        tree.tag_configure("high", background="#FEF2F2", foreground="#991B1B")
+        tree.tag_configure("high",   background="#FEF2F2", foreground="#991B1B")
         tree.tag_configure("medium", background="#FFFBEB", foreground="#92400E")
-        tree.tag_configure("low", background="#ECFDF5", foreground="#065F46")
+        tree.tag_configure("low",    background="#ECFDF5", foreground="#065F46")
         tree.tag_configure("normal", background="#ECFDF5", foreground="#065F46")
         return tree
 
@@ -238,23 +261,27 @@ class LabGuardianGUI:
         header.pack_propagate(False)
 
         self.header_left_var = tk.StringVar(value="")
-        tk.Label(header, textvariable=self.header_left_var, bg="#1A237E", fg="#FFFFFF", font=("Segoe UI", 11, "bold")).pack(side=tk.LEFT, padx=16)
+        tk.Label(
+            header, textvariable=self.header_left_var,
+            bg="#1A237E", fg="#FFFFFF", font=("Segoe UI", 11, "bold")
+        ).pack(side=tk.LEFT, padx=16)
 
-        end_btn = ttk.Button(header, text="End Session", style="Danger.TButton", command=self.on_end_session)
-        end_btn.pack(side=tk.RIGHT, padx=16, pady=8)
+        ttk.Button(header, text="End Session", style="Danger.TButton", command=self.on_end_session).pack(
+            side=tk.RIGHT, padx=16, pady=8
+        )
 
         self.notebook = ttk.Notebook(self.session_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        devices_tab = ttk.Frame(self.notebook)
-        network_tab = ttk.Frame(self.notebook)
+        devices_tab  = ttk.Frame(self.notebook)
+        network_tab  = ttk.Frame(self.notebook)
         processes_tab = ttk.Frame(self.notebook)
         terminal_tab = ttk.Frame(self.notebook)
 
-        self.notebook.add(devices_tab, text="Devices")
-        self.notebook.add(network_tab, text="Network")
+        self.notebook.add(devices_tab,   text="Devices")
+        self.notebook.add(network_tab,   text="Network")
         self.notebook.add(processes_tab, text="Processes")
-        self.notebook.add(terminal_tab, text="Terminal")
+        self.notebook.add(terminal_tab,  text="Terminal")
 
         # Devices tab
         self.devices_empty_var = tk.StringVar(value="")
@@ -265,7 +292,7 @@ class LabGuardianGUI:
         )
         tk.Label(devices_tab, textvariable=self.devices_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(4, 8))
 
-        # Network tab
+        # Network tab (browser history)
         self.network_empty_var = tk.StringVar(value="")
         self.network_debug_var = tk.StringVar(value="Browser entries fetched: 0")
         self.network_tree = self._tree_with_scroll(
@@ -296,8 +323,15 @@ class LabGuardianGUI:
         tk.Label(terminal_tab, textvariable=self.terminal_empty_var, bg="#FFFFFF", fg="#546E7A", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(4, 8))
         tk.Label(terminal_tab, textvariable=self.terminal_debug_var, bg="#FFFFFF", fg="#607D8B", font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=(0, 8))
 
-        self.status_bar = tk.Label(self.session_frame, textvariable=self.status_bar_var, bg="#ECEFF1", fg="#546E7A", font=("Segoe UI", 8), anchor="w")
+        self.status_bar = tk.Label(
+            self.session_frame, textvariable=self.status_bar_var,
+            bg="#ECEFF1", fg="#546E7A", font=("Segoe UI", 8), anchor="w"
+        )
         self.status_bar.pack(fill=tk.X)
+
+    # -------------------------------------------------------------------------
+    # Screen switching
+    # -------------------------------------------------------------------------
 
     def show_start(self):
         self.session_frame.pack_forget()
@@ -306,6 +340,10 @@ class LabGuardianGUI:
     def show_session(self):
         self.start_frame.pack_forget()
         self.session_frame.pack(fill=tk.BOTH, expand=True)
+
+    # -------------------------------------------------------------------------
+    # Utility helpers
+    # -------------------------------------------------------------------------
 
     def _record_count(self, data_map):
         return sum(len(data_map.get(k, [])) for k in ("devices", "browserHistory", "processes", "terminalEvents"))
@@ -325,11 +363,57 @@ class LabGuardianGUI:
         self.start_status_label.configure(fg="#2E7D32" if success else "#C62828")
         self.root.after(3000 if success else 4000, lambda: self.start_status_var.set(""))
 
+    def _risk_tag(self, risk_level: str) -> str:
+        risk = str(risk_level or "normal").lower()
+        return risk if risk in {"high", "medium", "low", "normal"} else "normal"
+
+    def _truncate(self, value: str, length: int = 60) -> str:
+        if value is None:
+            return ""
+        text = str(value)
+        return text if len(text) <= length else f"{text[:length]}..."
+
+    def _safe_time_from_iso(self, value: str) -> str:
+        if not value:
+            return "—"
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%H:%M:%S")
+        except Exception:
+            return "—"
+
+    def _safe_time_from_unix(self, value) -> str:
+        if value is None:
+            return "—"
+        try:
+            return datetime.fromtimestamp(float(value)).strftime("%H:%M:%S")
+        except Exception:
+            return "—"
+
+    def _title_fallback(self, url: str) -> str:
+        if not url:
+            return "—"
+        try:
+            parsed = urlparse(url)
+            host = parsed.netloc or ""
+            path = parsed.path or ""
+            text = (host + path).strip()
+            return text or url
+        except Exception:
+            return url
+
+    def _clear_tree(self, tree):
+        for item in tree.get_children():
+            tree.delete(item)
+
+    # -------------------------------------------------------------------------
+    # Session lifecycle
+    # -------------------------------------------------------------------------
+
     def on_start(self):
-        roll_no = self.roll_var.get().strip()
-        name = self.name_var.get().strip()
+        roll_no   = self.roll_var.get().strip()
+        name      = self.name_var.get().strip()
         session_id = self.session_var.get().strip()
-        lab_no = self.lab_var.get().strip()
+        lab_no    = self.lab_var.get().strip()
 
         if not roll_no or not name or not session_id or not lab_no:
             self._show_start_message("Roll No., Name, Session ID, and Lab No. are required.", success=False)
@@ -348,7 +432,7 @@ class LabGuardianGUI:
         self.header_left_var.set(f"{name} | {roll_no}")
 
         self.show_session()
-        self.refresh_session_view()
+        self._schedule_refresh()
 
     def on_end_session(self):
         if not self.active_session:
@@ -369,6 +453,10 @@ class LabGuardianGUI:
             "processes": set(),
             "terminalEvents": set(),
         }
+        self._browser_row_cache = {}
+        self._browser_tree_items = {}
+        self._refresh_pending = False
+
         self.network_debug_var.set("Browser entries fetched: 0")
         self.terminal_debug_var.set("Terminal events fetched: 0")
         for tree in [
@@ -380,6 +468,233 @@ class LabGuardianGUI:
             if tree is not None:
                 self._clear_tree(tree)
 
+    # -------------------------------------------------------------------------
+    # Refresh pipeline
+    #
+    # Flow:
+    #   1. _schedule_refresh()    — debounce guard, kicks off background read
+    #   2. _fetch_data_async()    — runs db.get_all_for_session in a daemon
+    #                               thread so the Tkinter main thread is free
+    #   3. _apply_payload(payload) — called via root.after(0) back on the main
+    #                               thread to update widgets
+    # -------------------------------------------------------------------------
+
+    def _schedule_refresh(self):
+        """Kick off a single background fetch cycle.
+
+        The guard flag prevents stacking multiple concurrent fetches if the
+        previous one is still running.
+        """
+        if not self.active_session:
+            return
+        if self._refresh_pending:
+            # Already a fetch in flight; reschedule check after one second.
+            self.root.after(1000, self._schedule_refresh)
+            return
+        self._refresh_pending = True
+        threading.Thread(target=self._fetch_data_async, daemon=True).start()
+
+    def _fetch_data_async(self):
+        """Run the SQLite read in a background thread.
+
+        Never touches Tkinter widgets — only reads from db and posts result
+        back to the main thread via root.after.
+        """
+        if not self.active_session:
+            self._refresh_pending = False
+            return
+
+        try:
+            t0 = datetime.now()
+            payload = db.get_all_for_session(
+                self.active_session["sessionId"],
+                self.active_session["rollNo"],
+            )
+            elapsed_ms = (datetime.now() - t0).total_seconds() * 1000
+            log.debug("db.get_all_for_session took %.1f ms", elapsed_ms)
+        except Exception as exc:
+            log.error("Error fetching session data: %s", exc)
+            self._refresh_pending = False
+            # Retry after the normal interval even on error.
+            self.root.after(_UI_REFRESH_MS, self._schedule_refresh)
+            return
+
+        # Post back to Tkinter main thread.
+        self.root.after(0, lambda: self._apply_payload(payload))
+
+    def _apply_payload(self, payload: dict):
+        """Paint the UI with the freshly fetched payload.
+
+        Runs on the Tkinter main thread. All widget operations are here.
+        """
+        self._refresh_pending = False
+
+        if not self.active_session:
+            return
+
+        # ── Devices ──────────────────────────────────────────────────────────
+        devices = payload.get("devices", [])
+        for row in devices:
+            row_id = row.get("_rowid")
+            if row_id in self.displayed_rowids["devices"]:
+                continue
+            self.displayed_rowids["devices"].add(row_id)
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            self.device_tree.insert(
+                "", tk.END,
+                values=(
+                    row.get("readable_name") or "USB Storage Device",
+                    row.get("message") or "",
+                    metadata.get("mountpoint") or "—",
+                    metadata.get("total_gb") if metadata.get("total_gb") is not None else "—",
+                    (row.get("risk_level") or "normal").lower(),
+                ),
+                tags=(self._risk_tag(row.get("risk_level")),),
+            )
+        self.devices_empty_var.set(
+            "No USB devices connected." if not self.device_tree.get_children() else ""
+        )
+
+        # ── Network (Browser History) ─────────────────────────────────────────
+        # Strategy: never clear the tree. For each DB row:
+        #   - New rowid → insert at the end.
+        #   - Known rowid with changed (visit_count, last_visited) → item.set()
+        #     to update values in-place (one Tkinter call, not delete+reinsert).
+        #   - Known rowid unchanged → skip entirely (zero Tkinter calls).
+        browser_history = sorted(
+            payload.get("browserHistory", payload.get("browser_history", [])),
+            key=lambda item: float(item.get("last_visited") or 0),
+        )
+
+        for row in browser_history:
+            row_id = row.get("_rowid")
+            visit_count   = int(row.get("visit_count") or 1)
+            last_visited  = row.get("last_visited")
+            cache_key     = (visit_count, last_visited)
+
+            if row_id not in self.displayed_rowids["browserHistory"]:
+                # New row — insert into tree.
+                self.displayed_rowids["browserHistory"].add(row_id)
+                self._browser_row_cache[row_id] = cache_key
+                title = row.get("title") or self._title_fallback(row.get("url") or "")
+                item_id = self.network_tree.insert(
+                    "", tk.END,
+                    values=(
+                        title,
+                        self._truncate(row.get("url") or "", 60),
+                        row.get("browser") or "—",
+                        self._safe_time_from_unix(last_visited),
+                        visit_count,
+                    ),
+                )
+                self._browser_tree_items[row_id] = item_id
+
+            elif self._browser_row_cache.get(row_id) != cache_key:
+                # Existing row whose counters changed — update in place.
+                self._browser_row_cache[row_id] = cache_key
+                item_id = self._browser_tree_items.get(row_id)
+                if item_id and self.network_tree.exists(item_id):
+                    self.network_tree.set(item_id, "last_visited", self._safe_time_from_unix(last_visited))
+                    self.network_tree.set(item_id, "visit_count", visit_count)
+            # else: unchanged — zero Tkinter calls.
+
+        self.network_debug_var.set(f"Browser entries fetched: {len(browser_history)}")
+        self.network_empty_var.set(
+            "No browsing activity since session started." if not self.network_tree.get_children() else ""
+        )
+
+        # ── Processes ─────────────────────────────────────────────────────────
+        risk_order = {"high": 0, "medium": 1, "low": 2, "normal": 3}
+        process_rows = sorted(
+            [
+                row for row in payload.get("processes", [])
+                if str(row.get("status") or "").lower() != "ended"
+                and str(row.get("risk_level") or "").lower() != "safe"
+            ],
+            key=lambda row: (
+                risk_order.get(str(row.get("risk_level") or "normal").lower(), 4),
+                str(row.get("detected_at") or ""),
+                int(row.get("_rowid") or 0),
+            ),
+        )
+
+        for row in process_rows:
+            row_id = row.get("_rowid")
+            if row_id in self.displayed_rowids["processes"]:
+                continue
+            self.displayed_rowids["processes"].add(row_id)
+            display_name = row.get("label") or row.get("name") or "Unknown Process"
+            self.process_tree.insert(
+                "", tk.END,
+                values=(
+                    display_name,
+                    row.get("pid") if row.get("pid") is not None else "—",
+                    f"{float(row.get('cpu') or 0.0):.1f}",
+                    f"{float(row.get('memory') or 0.0):.1f}",
+                    str(row.get("risk_level") or "normal").lower(),
+                    row.get("category") or "—",
+                ),
+                tags=(self._risk_tag(row.get("risk_level")),),
+            )
+        self.processes_empty_var.set(
+            "No notable processes detected." if not self.process_tree.get_children() else ""
+        )
+
+        # ── Terminal ──────────────────────────────────────────────────────────
+        terminal_rows = sorted(
+            payload.get("terminal_events", payload.get("terminalEvents", [])),
+            key=lambda item: str(item.get("detected_at") or ""),
+        )
+        for row in terminal_rows:
+            row_id = row.get("_rowid")
+            if row_id in self.displayed_rowids["terminalEvents"]:
+                continue
+            self.displayed_rowids["terminalEvents"].add(row_id)
+
+            full_command = row.get("full_command") or "—"
+            if full_command == "—" and str(row.get("event_type") or "") == "terminal_request":
+                ip   = row.get("remote_ip") or ""
+                port = row.get("remote_port") or ""
+                full_command = f"{ip}:{port}" if ip and port else ip or "—"
+
+            self.terminal_tree.insert(
+                "", tk.END,
+                values=(
+                    self._safe_time_from_iso(row.get("detected_at")),
+                    row.get("event_type") or "—",
+                    row.get("tool") or "unknown",
+                    full_command,
+                    row.get("remote_ip") or "—",
+                    (row.get("risk_level") or "normal").lower(),
+                ),
+                tags=(self._risk_tag(row.get("risk_level")),),
+            )
+
+        self.terminal_debug_var.set(f"Terminal events fetched: {len(terminal_rows)}")
+        self.terminal_empty_var.set(
+            "No terminal activity recorded." if not self.terminal_tree.get_children() else ""
+        )
+
+        self.status_bar_var.set(
+            f"Last updated: {datetime.now().strftime('%H:%M:%S')} | "
+            f"Devices: {len(devices)} | "
+            f"History: {len(browser_history)} | "
+            f"Processes: {len(process_rows)} | "
+            f"Terminal: {len(terminal_rows)}"
+        )
+
+        # Schedule next refresh.
+        if self.active_session:
+            self.root.after(_UI_REFRESH_MS, self._schedule_refresh)
+
+    # Kept for backward compatibility with any internal callers.
+    def refresh_session_view(self):
+        self._schedule_refresh()
+
+    # -------------------------------------------------------------------------
+    # Backend probe and export
+    # -------------------------------------------------------------------------
+
     def _probe_backend(self):
         host = config.BACKEND_HOST
         port = config.BACKEND_PORT
@@ -387,22 +702,19 @@ class LabGuardianGUI:
             socket.getaddrinfo(host, port)
         except OSError:
             return "no_lan"
-
         try:
             with socket.create_connection((host, port), timeout=3):
                 return "ok"
         except OSError as exc:
             if getattr(exc, "errno", None) in {errno.ENETUNREACH, errno.EHOSTUNREACH}:
                 return "no_lan"
-            if isinstance(exc, ConnectionRefusedError) or isinstance(exc, socket.timeout):
-                return "unreachable"
             return "unreachable"
 
     def on_export(self):
-        roll_no = self.roll_var.get().strip()
+        roll_no    = self.roll_var.get().strip()
         session_id = self.session_var.get().strip()
-        lab_no = self.lab_var.get().strip()
-        name = self.name_var.get().strip()
+        lab_no     = self.lab_var.get().strip()
+        name       = self.name_var.get().strip()
 
         if not roll_no or not session_id:
             self._show_start_message("Roll No. and Session ID are required for export.", success=False)
@@ -461,7 +773,6 @@ class LabGuardianGUI:
                 if not body.get("success"):
                     self.root.after(0, lambda: self._export_done(False, "Export failed: server did not confirm success."))
                     return
-
                 db.mark_synced(session_id, roll_no)
                 self.root.after(0, lambda: self._export_done(True, "Export complete. Data synced."))
             except requests.exceptions.Timeout:
@@ -471,10 +782,9 @@ class LabGuardianGUI:
             except requests.exceptions.HTTPError:
                 detail = ""
                 try:
-                    detail = response.text
+                    detail = response.text.strip()
                 except Exception:
-                    detail = ""
-                detail = detail.strip()
+                    pass
                 msg = f"Export failed: {response.status_code}"
                 if detail:
                     msg = f"{msg} - {detail}"
@@ -488,194 +798,9 @@ class LabGuardianGUI:
         self._set_export_state(False)
         self._show_start_message(message, success=success)
 
-    def _clear_tree(self, tree):
-        for item in tree.get_children():
-            tree.delete(item)
-
-    def _risk_tag(self, risk_level: str) -> str:
-        risk = str(risk_level or "normal").lower()
-        if risk in {"high", "medium", "low", "normal"}:
-            return risk
-        return "normal"
-
-    def _truncate(self, value: str, length: int = 60) -> str:
-        if value is None:
-            return ""
-        text = str(value)
-        return text if len(text) <= length else f"{text[:length]}..."
-
-    def _safe_time_from_iso(self, value: str) -> str:
-        if not value:
-            return "—"
-        try:
-            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%H:%M:%S")
-        except Exception:
-            return "—"
-
-    def _safe_time_from_unix(self, value):
-        if value is None:
-            return "—"
-        try:
-            return datetime.fromtimestamp(float(value)).strftime("%H:%M:%S")
-        except Exception:
-            return "—"
-
-    def _title_fallback(self, url: str) -> str:
-        if not url:
-            return "—"
-        try:
-            parsed = urlparse(url)
-            host = parsed.netloc or ""
-            path = parsed.path or ""
-            text = (host + path).strip()
-            return text or url
-        except Exception:
-            return url
-
-    def refresh_session_view(self):
-        if not self.active_session:
-            return
-
-        payload = db.get_all_for_session(self.active_session["sessionId"], self.active_session["rollNo"])
-
-        # Devices
-        devices = payload.get("devices", [])
-        for row in devices:
-            row_id = row.get("_rowid")
-            if row_id in self.displayed_rowids["devices"]:
-                continue
-            self.displayed_rowids["devices"].add(row_id)
-            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-            self.device_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    row.get("readable_name") or "USB Storage Device",
-                    row.get("message") or "",
-                    metadata.get("mountpoint") or "—",
-                    metadata.get("total_gb") if metadata.get("total_gb") is not None else "—",
-                    (row.get("risk_level") or "normal").lower(),
-                ),
-                tags=(self._risk_tag(row.get("risk_level")),),
-            )
-        self.devices_empty_var.set("No USB devices connected." if len(self.device_tree.get_children()) == 0 else "")
-
-        # Network (Browser History)
-        browser_history = sorted(
-            payload.get("browser_history", payload.get("browserHistory", [])),
-            key=lambda item: float(item.get("last_visited") or 0),
-            reverse=False,
-        )
-        # Browser history can update in place (visit_count/last_visited), so repaint each cycle.
-        self._clear_tree(self.network_tree)
-        self.displayed_rowids["browserHistory"] = set()
-        for row in browser_history:
-            row_id = row.get("_rowid")
-            if row_id in self.displayed_rowids["browserHistory"]:
-                continue
-            self.displayed_rowids["browserHistory"].add(row_id)
-            title = row.get("title") or self._title_fallback(row.get("url") or "")
-            self.network_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    title,
-                    self._truncate(row.get("url") or "", 60),
-                    row.get("browser") or "—",
-                    self._safe_time_from_unix(row.get("last_visited")),
-                    int(row.get("visit_count") or 1),
-                ),
-            )
-        self.network_debug_var.set(f"Browser entries fetched: {len(browser_history)}")
-        self.network_empty_var.set("No browsing activity since session started." if len(self.network_tree.get_children()) == 0 else "")
-
-        # Processes
-        process_rows = [
-            row
-            for row in payload.get("processes", [])
-            if str(row.get("status") or "").lower() != "ended"
-            and str(row.get("risk_level") or "").lower() != "safe"
-        ]
-        risk_order = {"high": 0, "medium": 1, "low": 2, "normal": 3}
-        process_rows.sort(
-            key=lambda row: (
-                risk_order.get(str(row.get("risk_level") or "normal").lower(), 4),
-                str(row.get("detected_at") or ""),
-                int(row.get("_rowid") or 0),
-            )
-        )
-
-        for row in process_rows:
-            row_id = row.get("_rowid")
-            if row_id in self.displayed_rowids["processes"]:
-                continue
-            self.displayed_rowids["processes"].add(row_id)
-            display_name = row.get("label") or row.get("name") or "Unknown Process"
-            self.process_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    display_name,
-                    row.get("pid") if row.get("pid") is not None else "—",
-                    f"{float(row.get('cpu') or 0.0):.1f}",
-                    f"{float(row.get('memory') or 0.0):.1f}",
-                    str(row.get("risk_level") or "normal").lower(),
-                    row.get("category") or "—",
-                ),
-                tags=(self._risk_tag(row.get("risk_level")),),
-            )
-
-        self.processes_empty_var.set("No notable processes detected." if len(self.process_tree.get_children()) == 0 else "")
-
-        # Terminal
-        terminal_rows = sorted(
-            payload.get("terminal_events", payload.get("terminalEvents", [])),
-            key=lambda item: str(item.get("detected_at") or ""),
-            reverse=False,
-        )
-        # Keep terminal rendering fully in sync with DB state per refresh.
-        self._clear_tree(self.terminal_tree)
-        self.displayed_rowids["terminalEvents"] = set()
-        for row in terminal_rows:
-            row_id = row.get("_rowid")
-            if row_id in self.displayed_rowids["terminalEvents"]:
-                continue
-            self.displayed_rowids["terminalEvents"].add(row_id)
-
-            full_command = row.get("full_command") or "—"
-            if full_command == "—" and str(row.get("event_type") or "") == "terminal_request":
-                ip = row.get("remote_ip") or ""
-                port = row.get("remote_port") or ""
-                if ip and port:
-                    full_command = f"{ip}:{port}"
-                elif ip:
-                    full_command = ip
-
-            self.terminal_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    self._safe_time_from_iso(row.get("detected_at")),
-                    row.get("event_type") or "—",
-                    row.get("tool") or "unknown",
-                    full_command,
-                    row.get("remote_ip") or "—",
-                    (row.get("risk_level") or "normal").lower(),
-                ),
-                tags=(self._risk_tag(row.get("risk_level")),),
-            )
-
-        self.terminal_debug_var.set(f"Terminal events fetched: {len(terminal_rows)}")
-        self.terminal_empty_var.set("No terminal activity recorded." if len(self.terminal_tree.get_children()) == 0 else "")
-
-        self.status_bar_var.set(
-            f"Last updated: {datetime.now().strftime('%H:%M:%S')} | Devices: {len(devices)} | "
-            f"History: {len(browser_history)} | Processes: {len(process_rows)} | Terminal: {len(terminal_rows)}"
-        )
-
-        interval_seconds = int(getattr(config, "MONITOR_INTERVAL", getattr(config, "SNAPSHOT_INTERVAL", 5)))
-        interval_ms = max(1000, interval_seconds * 1000)
-        self.root.after(interval_ms, self.refresh_session_view)
+    # -------------------------------------------------------------------------
+    # Window close
+    # -------------------------------------------------------------------------
 
     def on_close(self):
         if self.runtime.running:

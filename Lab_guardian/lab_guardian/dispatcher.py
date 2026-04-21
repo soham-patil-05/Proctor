@@ -77,6 +77,7 @@ def _normalize_browser_entry(entry: dict) -> dict:
     try:
         if last_visited is not None:
             last_visited = float(last_visited)
+            # If stored in milliseconds, convert to seconds.
             if last_visited > 1e10:
                 last_visited = last_visited / 1000.0
     except (TypeError, ValueError):
@@ -96,7 +97,12 @@ def _normalize_browser_entry(entry: dict) -> dict:
     }
 
 
-async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[asyncio.Event] = None):
+async def run(
+    session_id: str,
+    roll_no: str,
+    lab_no: str,
+    stop_event: Optional[asyncio.Event] = None,
+):
     """Start all monitors and persist event stream to local DB."""
 
     if stop_event is None:
@@ -171,7 +177,6 @@ async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[a
                     merged["risk_level"] = meta.get("risk_level")
                 if meta.get("category") is not None and merged.get("category") is None:
                     merged["category"] = meta.get("category")
-
                 normalized = _normalize_process(merged)
                 risk = str(normalized.get("risk_level") or "").lower()
                 if risk in {"high", "medium"}:
@@ -217,32 +222,42 @@ async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[a
                 db.replace_terminal_events(session_id, roll_no, events)
 
             else:
-                print(f"[dispatcher] Unrecognized event type: {event_type}")
+                log.debug("Unrecognized event type: %s", event_type)
 
     async def browser_history_monitor(send_fn):
-        """Monitor browser history for visited URLs."""
+        """Monitor browser history.
+
+        ``browser_history.get_new_history()`` is a blocking function that does
+        disk I/O (shutil.copy2 + sqlite3 queries). It is offloaded to the
+        default thread executor so the async event loop is never blocked.
+        """
         browser_history.initialize_agent_start_time()
         log.info("Browser history monitor started")
+        loop = asyncio.get_event_loop()
 
         while True:
             try:
-                new_urls = browser_history.get_new_history()
+                # Run the blocking scan in a thread — does NOT block the loop.
+                new_urls = await loop.run_in_executor(
+                    None, browser_history.get_new_history
+                )
                 if new_urls:
-                    await send_fn(
-                        {
-                            "type": "browser_history",
-                            "data": new_urls,
-                            "ts": time.time(),
-                            "meta": {
-                                "risk_level": "normal",
-                                "category": "browser",
-                                "message": f"{len(new_urls)} URL(s) visited during session",
-                            },
-                        }
-                    )
+                    await send_fn({
+                        "type": "browser_history",
+                        "data": new_urls,
+                        "ts": time.time(),
+                        "meta": {
+                            "risk_level": "normal",
+                            "category": "browser",
+                            "message": f"{len(new_urls)} URL(s) visited during session",
+                        },
+                    })
             except Exception as exc:
                 log.error("Browser history scan error: %s", exc, exc_info=True)
-            await asyncio.sleep(10)
+
+            # 30 s between browser scans — browser history does not need
+            # sub-second freshness and each scan does real disk I/O.
+            await asyncio.sleep(30)
 
     async def stop_waiter():
         await stop_event.wait()
@@ -259,8 +274,9 @@ async def run(session_id: str, roll_no: str, lab_no: str, stop_event: Optional[a
     try:
         done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
-            if task.exception():
-                log.error("Task %s failed: %s", task.get_name(), task.exception())
+            exc = task.exception() if not task.cancelled() else None
+            if exc:
+                log.error("Task %s failed: %s", task.get_name(), exc)
     except asyncio.CancelledError:
         log.info("Dispatcher cancelled")
     finally:
