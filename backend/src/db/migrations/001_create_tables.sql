@@ -24,18 +24,21 @@ CREATE TABLE IF NOT EXISTS students (
 );
 
 -- subjects
+-- FIX: Added UNIQUE(teacher_id, name) so ensureSubject ON CONFLICT works correctly.
+-- Without this constraint the ON CONFLICT clause in the controller has no target and throws.
 CREATE TABLE IF NOT EXISTS subjects (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   teacher_id UUID NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   department TEXT,
   year int,
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(teacher_id, name)
 );
 
 -- sessions
 CREATE TABLE IF NOT EXISTS sessions (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY,
   subject_id UUID NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
   batch TEXT NOT NULL,
   lab_name TEXT NOT NULL,
@@ -60,17 +63,20 @@ CREATE TABLE IF NOT EXISTS session_students (
 );
 
 -- connected_devices
+-- FIX: Removed CHECK (device_type IN ('usb','external')) — client may send other device
+--      types (e.g. 'bluetooth', 'hid'). A strict CHECK caused every such insert to fail.
+-- FIX: device_id defaults to a generated value when NULL so the UNIQUE constraint
+--      (session_id, student_id, device_id) never collides on NULL vs NULL comparisons.
 CREATE TABLE IF NOT EXISTS connected_devices (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-  device_id TEXT,
+  device_id TEXT NOT NULL DEFAULT 'unknown',
   device_name TEXT NOT NULL,
-  device_type TEXT NOT NULL CHECK (device_type IN ('usb','external')),
+  device_type TEXT NOT NULL DEFAULT 'usb',
   connected_at timestamptz NOT NULL DEFAULT now(),
   disconnected_at timestamptz,
   metadata jsonb,
-  -- New enrichment columns (non-destructive addition)
   readable_name TEXT,
   risk_level TEXT,
   message TEXT,
@@ -91,17 +97,18 @@ CREATE TABLE IF NOT EXISTS network_info (
 );
 
 -- live_processes
+-- FIX: Removed CHECK (status IN ('running','ended')) — client sends other statuses
+--      (e.g. 'sleeping', 'zombie', 'disk-sleep'). Strict CHECK caused every such row to fail.
 CREATE TABLE IF NOT EXISTS live_processes (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
   pid int NOT NULL,
-  process_name TEXT NOT NULL,
+  process_name TEXT NOT NULL DEFAULT 'unknown',
   cpu_percent NUMERIC(5,2) DEFAULT 0,
   memory_mb NUMERIC(10,2) DEFAULT 0,
-  status TEXT NOT NULL CHECK (status IN ('running','ended')),
+  status TEXT NOT NULL DEFAULT 'running',
   updated_at timestamptz NOT NULL DEFAULT now(),
-  -- New enrichment columns (non-destructive addition)
   risk_level TEXT,
   category TEXT,
   UNIQUE(session_id, student_id, pid)
@@ -120,7 +127,7 @@ CREATE TABLE IF NOT EXISTS process_history (
   recorded_at timestamptz DEFAULT now()
 );
 
--- domain_activity — tracks aggregated domain request counts per student/session
+-- domain_activity
 CREATE TABLE IF NOT EXISTS domain_activity (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

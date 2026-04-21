@@ -12,7 +12,7 @@ import { pool } from './db/index.js';
  */
 const server = http.createServer(app);
 
-server.listen(config.port, () => {
+server.listen(config.port, '0.0.0.0', () => {
     console.log(`[HTTP] Listening on port ${config.port}`);
 });
 

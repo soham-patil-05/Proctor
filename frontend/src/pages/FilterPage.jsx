@@ -32,6 +32,14 @@ export default function FilterPage() {
       return;
     }
 
+    let start = form.rollNoStart || undefined;
+    let end = form.rollNoEnd || undefined;
+
+    if (!start || !end) {
+      start = undefined;
+      end = undefined;
+    }
+
     setLoading(true);
     try {
       const result = await queryStudents({
@@ -39,10 +47,10 @@ export default function FilterPage() {
         startTime: form.startTime || undefined,
         endTime: form.endTime || undefined,
         labNo: form.labNo !== 'All' ? form.labNo : undefined,
-        rollNoStart: form.rollNoStart || undefined,
-        rollNoEnd: form.rollNoEnd || undefined,
+        rollNoStart: start,
+        rollNoEnd: end,
       });
-      setRows(result);
+      setRows(result.data || []);
     } catch (err) {
       setError(err.message || 'Query failed');
       setRows([]);

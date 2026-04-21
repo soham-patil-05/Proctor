@@ -5,7 +5,15 @@ import pg from 'pg';
 const RETENTION_DAYS = 7;
 
 async function cleanup() {
-    const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+    if (!process.env.DATABASE_URL) {
+        console.error('[Cleanup] ERROR: DATABASE_URL is not defined.');
+        process.exit(1);
+    }
+
+    const client = new pg.Client({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+    });
     await client.connect();
 
     const cutoff = `now() - interval '${RETENTION_DAYS} days'`;

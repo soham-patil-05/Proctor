@@ -1,10 +1,11 @@
 // src/config/index.js — centralised configuration
 import 'dotenv/config';
 
-/* ─── env helpers ───────────────────────────────────────────────── */
-const env = (key, fallback) => process.env[key] ?? fallback;
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL environment variable is required');
+}
 
 export const config = Object.freeze({
-  port:        parseInt(env('PORT', '8000'), 10),
-  databaseUrl: env('DATABASE_URL', 'postgres://postgres:password@localhost:5432/lab_monitor'),
+  port: process.env.PORT || 8000,
+  databaseUrl: process.env.DATABASE_URL,
 });
