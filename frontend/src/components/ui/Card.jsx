@@ -1,19 +1,12 @@
-export default function Card({
-  children,
-  className = '',
-  hoverable = false,
-  onClick,
-  ...props
-}) {
-  const baseClasses = 'bg-white rounded-lg shadow-[var(--shadow-md)] transition-all duration-200';
-  const hoverClasses = hoverable ? 'hover:shadow-[var(--shadow-lg)] hover:-translate-y-1 cursor-pointer' : '';
+export default function Card({ children, className = '', hoverable = false, onClick, ...props }) {
+  const base =
+    'bg-white rounded-xl border border-[var(--color-gray-200)] shadow-[var(--shadow-sm)] transition-all duration-150';
+  const hover = hoverable
+    ? 'hover:shadow-[var(--shadow-md)] hover:-translate-y-0.5 cursor-pointer'
+    : '';
 
   return (
-    <div
-      onClick={onClick}
-      className={`${baseClasses} ${hoverClasses} ${className}`}
-      {...props}
-    >
+    <div onClick={onClick} className={`${base} ${hover} ${className}`} {...props}>
       {children}
     </div>
   );

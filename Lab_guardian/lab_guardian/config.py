@@ -14,8 +14,10 @@ BACKEND_PORT = int(os.environ.get("LAB_GUARDIAN_BACKEND_PORT", str(_parsed_api.p
 
 # Shared lab identifiers. Keep identical to frontend/src/constants/labs.js
 LAB_LIST = [
-	"L01", "L02", "L03", "L04", "L05",
-	"L06", "L07", "L08", "L09", "L10",
+    "A3-301", "A3-302", "A3-303", "A3-304", "A3-305",
+    "A3-306", "A3-307", "A3-308", "A3-309", "A3-310", "A3-311",
+    "A3-401", "A3-402", "A3-403", "A3-404", "A3-405",
+    "A3-406", "A3-407", "A3-408", "A3-409", "A3-410", "A3-411",
 ]
 
 # Monitor intervals (seconds)
