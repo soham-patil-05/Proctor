@@ -7,3 +7,11 @@ Lab_guardian/venv/
 temp_edge.db
 temp_history.db
 *.db
+
+# PyInstaller build artifacts
+Lab_guardian/build/
+Lab_guardian/dist/
+Lab_guardian/.build_venv/
+Lab_guardian/.deb_staging/
+Lab_guardian/*.deb
+Lab_guardian/*.spec.bak

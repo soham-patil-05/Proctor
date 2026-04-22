@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=LabGuardian
+GenericName=Student Monitor
+Comment=Lab Guardian — Student activity monitoring during examinations
+Exec=/usr/bin/lab_guardian
+Icon=lab_guardian
+Terminal=false
+Categories=Education;Utility;
+Keywords=lab;guardian;monitor;proctor;exam;
+StartupNotify=true
+StartupWMClass=lab_guardian

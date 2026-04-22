@@ -2,10 +2,19 @@ Package: lab-guardian
 Version: 1.0.0
 Section: utils
 Priority: optional
-Architecture: all
-Depends: python3 (>= 3.9), python3-pip, python3-psutil, python3-requests
+Architecture: amd64
+Depends: iproute2, libx11-6, libxext6, libxrender1, libtk8.6 | libtk
+Recommends: auditd
 Maintainer: Lab Insight Team <labinsight@example.com>
-Description: Lab Guardian — Student monitoring agent
- Lightweight Python agent that reports running processes,
- connected devices and network information to the Lab Insight
- backend via WebSocket.
+Description: Lab Guardian — Student monitoring agent (standalone binary)
+ Lab Guardian is a fully self-contained executable that monitors student
+ activity during lab examinations.  It tracks running processes, connected
+ USB storage devices, browser history, and terminal network commands.
+ .
+ This package bundles Python 3, SQLite, psutil, requests, pyudev, netifaces
+ and all other Python dependencies inside a single binary — no Python
+ installation is required on the target machine.
+ .
+ System-level dependencies (auditd for terminal command capture, iproute2
+ for the ss command) are installed automatically as Debian dependencies.
+Installed-Size: 30000
