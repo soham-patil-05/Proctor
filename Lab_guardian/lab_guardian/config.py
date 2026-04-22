@@ -7,7 +7,7 @@ import os
 from urllib.parse import urlparse
 
 # Backend server URL
-API_BASE_URL = os.environ.get("LAB_GUARDIAN_API_URL", "http://localhost:8000")
+API_BASE_URL = os.environ.get("LAB_GUARDIAN_API_URL", "https://proctor-0luy.onrender.com")
 _parsed_api = urlparse(API_BASE_URL)
 BACKEND_HOST = os.environ.get("LAB_GUARDIAN_BACKEND_HOST", _parsed_api.hostname or "localhost")
 BACKEND_PORT = int(os.environ.get("LAB_GUARDIAN_BACKEND_PORT", str(_parsed_api.port or (443 if _parsed_api.scheme == "https" else 80))))
