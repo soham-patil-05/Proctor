@@ -29,7 +29,7 @@ const toQueryString = (params = {}) => {
 
 export async function queryStudents(params) {
   const query = toQueryString(params);
-  const response = await fetch(`${API_BASE}/telemetry/query?${query}`, {
+  const response = await fetch(`${API_BASE}/api/telemetry/query?${query}`, {
     headers: { 'Content-Type': 'application/json' },
   });
   return handleResponse(response);
@@ -37,7 +37,7 @@ export async function queryStudents(params) {
 
 export async function getStudentDetail(rollNo, sessionId) {
   const query = toQueryString({ sessionId });
-  const response = await fetch(`${API_BASE}/telemetry/student/${encodeURIComponent(rollNo)}?${query}`, {
+  const response = await fetch(`${API_BASE}/api/telemetry/student/${encodeURIComponent(rollNo)}?${query}`, {
     headers: { 'Content-Type': 'application/json' },
   });
   return handleResponse(response);
